@@ -1,7 +1,7 @@
 ---
 title: "Per-Call Timeouts for eval(), check(), and analyze()"
 sidebarTitle: "Per-Call Timeouts"
-description: "Override the constructor timeout for individual eval(), check(), and analyze() calls — cover guest initialization, handle unbounded and rejected values, and track remaining budget."
+description: "Set a per-call timeout on eval(), check(), or analyze(), overriding the constructor. Positive covers guest init; zero is unbounded; negative is rejected."
 ---
 
 Both the PHP facade (`Terrarium\Terrarium`) and the engine primitive

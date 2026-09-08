@@ -1,7 +1,7 @@
 ---
-title: "Deploying Terrarium to Production and AWS Lambda"
+title: "Deploy Terrarium to Production and AWS Lambda via Bref"
 sidebarTitle: "Deployment"
-description: "Deploy Terrarium to self-hosted Linux, Docker containers, and AWS Lambda via Bref — with ahead-of-time precompilation for cold-start-free serverless deployments."
+description: "Deploy Terrarium to self-hosted Linux, Docker, and AWS Lambda via Bref — with ahead-of-time guest precompilation to eliminate cold-start Cranelift cost."
 ---
 
 Terrarium has three deployment targets: **self-hosted Linux**, **Docker containers**, and **AWS Lambda via Bref**. Each involves the same three pieces — the extension `.so`, the PHP library, and one or more guest `.wasm` files. The key concern in serverless environments is the **Cranelift compilation cost**: the first time a process loads a guest it compiles the `.wasm` to native code, which takes 1–2 seconds for a heavy guest. On Lambda, where each cold start is a fresh process and the on-disk module cache cannot persist, that cost is paid on every cold start — unless you precompile ahead of time.

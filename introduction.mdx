@@ -1,5 +1,5 @@
 ---
-title: "Terrarium: WebAssembly Sandboxing for PHP"
+title: "Terrarium: WebAssembly PHP Sandboxing for Untrusted Code"
 sidebarTitle: "Introduction"
 description: "Learn how Terrarium runs untrusted JavaScript, TypeScript, Python, or PHP inside PHP using WebAssembly isolation with a typed capability SDK."
 ---
@@ -30,7 +30,7 @@ Swap `quickjs_guest.wasm` for `boa_guest.wasm`, `rustpython_guest.wasm`, or `php
 
 Terrarium is built on three layers:
 
-```
+```text
 PHP (trusted)  ──ext-php-rs──►  Rust bridge  ──wasmtime──►  WASM guest (untrusted)
    register()                  dispatch table                a real language engine
    eval()                      host_call(name, bytes)        SDK names as globals

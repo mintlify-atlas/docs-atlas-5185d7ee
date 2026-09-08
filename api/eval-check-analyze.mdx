@@ -1,7 +1,7 @@
 ---
-title: "eval(), check(), and analyze() — Running and Validating Guest Code"
-sidebarTitle: "eval / check / analyze"
-description: "Run guest source with eval(), validate it statically with check(), or extract JSON Schemas alongside diagnostics with analyze() — all with optional per-call timeouts."
+title: "Running and Validating Guest Code: eval, check, analyze"
+sidebarTitle: "Eval & Check"
+description: "Run guest source with eval(), validate without running via check(), or extract JSON Schemas with analyze(). All three accept optional per-call timeouts."
 ---
 
 `eval()`, `check()`, and `analyze()` are the primary execution and validation surface. All three accept an optional per-call `$timeoutMs` that overrides (or supplements) the constructor default for that call only.
@@ -94,7 +94,7 @@ The same static pass as `check()`, with everything the guest was additionally as
 
 ```php
 /** @return array{
- *     diagnostics: list<array{message: string, type?: string, line?: int}>,
+ *     diagnostics: list<array{message: string, type?: string, line?: int, ordinal?: int}>,
  *     schemas: list<array{ordinal: int, callee: string, line: int, schema: string}>
  * } */
 ```
@@ -149,6 +149,7 @@ The subset is deliberately narrow — exactly what can be round-tripped back to 
 | `"a" \| "b"` | `{"type":"string","enum":["a","b"]}` |
 | `"a" \| 1 \| true` | `{"enum":[1,"a",true]}` (JSON-compatible, no single `type`) |
 | `string \| null` | `{"type":["string","null"]}` |
+| `"a" \| "b" \| null` | `{"type":["string","null"],"enum":["a","b",null]}` |
 | `A & B`, `Partial<T>`, `Pick<T, K>`, `Omit<T, K>` | Whatever plain object they reduce to |
 
 Everything else is **refused** with a `TSSchemaError` diagnostic naming the offending member path. Refused types include: `any`, `unknown`, `never`, `undefined` (including `T | undefined`), `void`, `bigint`, `symbol`, functions and methods, class instances, TypeScript `enum`, `Date`/`Map`/`Set`/`RegExp`, `Promise`, index signatures, tuples, template literal types, unresolved generic parameters, `{…} | null` and `T[] | null` (use `type: [x, "null"]` for nullable primitives), and recursive types.

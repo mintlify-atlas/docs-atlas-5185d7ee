@@ -1,7 +1,7 @@
 ---
 title: "Terrarium Architecture: How WebAssembly Sandboxing Works"
 sidebarTitle: "Architecture"
-description: "Understand how Terrarium's PHP-Rust-Wasm stack works: the host ABI, value marshaling, the capability dispatch table, and how the guest isolation boundary is enforced."
+description: "How Terrarium's PHP-Rust-Wasm stack works: the host ABI, value marshaling, the capability dispatch table, and how the guest isolation boundary is enforced."
 ---
 
 Terrarium is built on three cooperating layers. **PHP** (trusted, full Zend engine) is where you define the SDK — registering closures, granting live objects, and calling `eval()`. **Rust** (the extension itself, built with `ext-php-rs` and embedding Wasmtime) owns the engine lifecycle, drives the `host_call` dispatch table, and marshals values across the boundary. The **WebAssembly guest** (untrusted) is a real language engine — QuickJS, RustPython, php-src, or any other WASM target — running in an isolated linear memory with no authority beyond what you registered.

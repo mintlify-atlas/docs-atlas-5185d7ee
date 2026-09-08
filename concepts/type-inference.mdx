@@ -1,7 +1,7 @@
 ---
-title: "How Terrarium Infers Types from PHP Signatures"
+title: "Terrarium Type Inference: PHP Signatures to Typed Guest SDKs"
 sidebarTitle: "Type Inference"
-description: "Terrarium reflects PHP function signatures and PHPDoc to emit .d.ts, .pyi, and .php stubs — so guest authors get a typed SDK without writing separate schemas."
+description: "How Terrarium reflects PHP signatures and PHPDoc to emit .d.ts, .pyi, and .php stubs — giving guest authors a typed SDK without separate schemas."
 ---
 
 Every time you call `register()`, Terrarium reads the registered closure via PHP's `ReflectionFunction` and a PHPDoc recursive-descent parser (`PhpDocType`), builds a neutral type AST, and stores it alongside the capability. That stored model drives `types('dts')`, `types('pyi')`, and `types('php')` — per-language type declarations emitted on demand. **The PHP type annotation is the schema.** No separate IDL, no hand-written type strings.

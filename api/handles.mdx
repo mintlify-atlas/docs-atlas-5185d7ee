@@ -1,5 +1,5 @@
 ---
-title: "grant(), resolve(), and revoke() — Capability Handles for Live Objects"
+title: "Capability Handles — grant(), resolve(), and revoke()"
 sidebarTitle: "Handles"
 description: "Pass live PHP objects (DB connections, file handles) to guests as opaque integer handles. The object stays host-side; the guest only ever sees the handle."
 ---
@@ -36,7 +36,7 @@ Drops the handle from the table, releasing the reference. Returns `true` if the 
 
 The handle is just an opaque integer in the guest — not a pointer, just an ID the guest received and passes back. The guest cannot dereference it, cannot inspect the object it represents, and cannot form any pointer into host memory. The only thing a guest can do with a handle is hand it to a registered capability that calls `resolve()`.
 
-```
+```text
 PHP (host)                   Wasm guest (untrusted)
 ─────────────────────────    ──────────────────────
 $pdo = new PDO(…);

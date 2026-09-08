@@ -1,7 +1,7 @@
 ---
-title: "Terrarium\\Runtime — The Native Engine Primitive"
+title: "Terrarium\\Runtime — The Low-Level Engine Primitive"
 sidebarTitle: "Runtime Primitive"
-description: "Terrarium\\Runtime is the Rust-backed engine primitive. Use it directly when you need byte-level access, setCompileOptions(), setTypes(), or the analyze() method."
+description: "The Rust-backed engine primitive the facade wraps. Use directly for bytes, setCompileOptions(), setTypes(), and precompile() without file-path loading."
 ---
 
 `Terrarium\Runtime` is the low-level engine primitive provided by the Rust extension. The `Terrarium\Terrarium` facade wraps it: it reads a file path, infers types from your PHP closures, and calls `setTypes()` after each `register()`. Use `Runtime` directly when you need to work with raw bytes, build a custom wrapper, set compile options manually via `setCompileOptions()`, or manage type declarations yourself with `setTypes()`.

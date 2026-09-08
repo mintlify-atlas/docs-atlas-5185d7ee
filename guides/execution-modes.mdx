@@ -1,7 +1,7 @@
 ---
-title: "Shared vs Isolated Execution Modes"
+title: "Terrarium Execution Modes: Shared vs Isolated Instances"
 sidebarTitle: "Execution Modes"
-description: "Compare Terrarium's shared and isolated execution modes — when to use each, how fault recovery works, and what two Terrarium objects over the same wasm share."
+description: "Compare shared and isolated execution modes — when to use each, how fault recovery works, and what two Terrarium instances over the same guest share."
 ---
 
 The `isolated` constructor flag controls the **lifecycle of the underlying Wasm instance** — not guest program state, which is always fresh per eval regardless of mode. Understanding the distinction between these two things is the key to choosing the right mode.

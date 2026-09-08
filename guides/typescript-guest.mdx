@@ -1,7 +1,7 @@
 ---
 title: "TypeScript Guest: Type-Checked Code in the Sandbox"
 sidebarTitle: "TypeScript Guest"
-description: "Use the TypeScript guest to type-check every eval against your registered PHP SDK before execution, with syncOnly mode and JSON Schema extraction from type arguments."
+description: "Type-check sandboxed TypeScript against your PHP SDK before execution, enforce syncOnly to ban async code, and extract JSON Schemas from type arguments."
 ---
 
 The TypeScript guest runs the **real TypeScript compiler (tsc 6.0.3) inside the WASM sandbox**. The type environment is the capability environment: tsc checks every `eval()` against the `.d.ts` generated from your registered PHP SDK before a single line of guest code executes. A type error stops execution entirely and surfaces as a `Terrarium\GuestException` with the TS diagnostic code and source line. A clean check is a guarantee that the code will run — not merely that it is well-formed text.
@@ -183,11 +183,14 @@ The schema subset is deliberately narrow — exactly what a type-level schema re
 | TypeScript | JSON Schema |
 |------------|-------------|
 | `{ a: string; b?: number }` | `{"type":"object","properties":{…},"required":["a"],"additionalProperties":false}` |
+| `readonly` members | identical — `readonly` says nothing about JSON |
 | `T[]`, `readonly T[]`, `Array<T>` | `{"type":"array","items":…}` |
 | `string` / `number` / `boolean` / `null` | `{"type":"string"}` … |
 | `"yes"` / `42` / `true` | `{"const":"yes"}` |
 | `"a" \| "b"` | `{"type":"string","enum":["a","b"]}` |
+| `"a" \| 1 \| true` | `{"enum":[1,"a",true]}` (mixed types — no single `type`) |
 | `string \| null` | `{"type":["string","null"]}` |
+| `"a" \| "b" \| null` | `{"type":["string","null"],"enum":["a","b",null]}` |
 | `A & B`, `Partial<T>`, `Pick<T,K>`, `Omit<T,K>` | whatever plain object they reduce to |
 
 Everything else is **refused** with a `TSSchemaError` diagnostic naming the offending member path — `any`, `unknown`, `never`, `undefined`, `void`, `bigint`, functions, class instances, `Date`/`Map`/`Set`/`RegExp`, index signatures (`Record<string, T>`), tuples, unresolved generics, recursive types, and unions other than nullable primitives and literals.

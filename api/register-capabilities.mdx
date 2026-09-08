@@ -1,14 +1,14 @@
 ---
 title: "register() — Expose PHP Functions as Guest Capabilities"
 sidebarTitle: "register()"
-description: "register() adds a PHP callable to the capability allowlist under a dotted name. It is the entire trust boundary: the guest can reach nothing you did not register."
+description: "register() exposes a PHP callable as a named guest capability. The allowlist of registered names is the entire trust boundary — nothing else is reachable."
 ---
+
+`register()` exposes a PHP callable to the guest under a flat, dotted name. The registered allowlist is the **entire trust boundary** — the guest can reach nothing you have not explicitly registered. There is no synthetic root: a capability named `user.fetch` is called as `user.fetch(...)` in the guest, not as `sdk.user.fetch(...)`.
 
 ```php
 register(string $name, callable $fn): void
 ```
-
-`register()` exposes a PHP callable to the guest under a flat, dotted name. The registered allowlist is the **entire trust boundary** — the guest can reach nothing you have not explicitly registered. There is no synthetic root: a capability named `user.fetch` is called as `user.fetch(...)` in the guest, not as `sdk.user.fetch(...)`.
 
 After each `register()` call, the TypeScript guest's type declaration (`.d.ts`) is regenerated from all registered closures and pushed to the guest. This means the TypeScript compiler inside the guest always type-checks against an up-to-date SDK as capabilities are added.
 

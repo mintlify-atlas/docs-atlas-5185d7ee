@@ -1,14 +1,14 @@
 ---
-title: "Terrarium Exception Hierarchy and Error Handling"
+title: "Terrarium Exceptions — PHP Error Hierarchy and Types"
 sidebarTitle: "Errors"
-description: "Terrarium surfaces guest failures as a typed PHP exception hierarchy. Learn the difference between sandbox-level faults and guest-program errors, and how output survives a throw."
+description: "Typed PHP exceptions for every Terrarium failure: TrapException, TimeoutException, MemoryException for sandbox faults; GuestException for guest errors."
 ---
 
 A Terrarium run produces three independent things: the **result** (the return value of `eval()`), the **output** (`output()`), and — on failure — a typed **exception**. Failures come from two cleanly separated layers: sandbox-level faults (the engine aborting) and guest-program errors (the guest's own language-level error, caught and forwarded).
 
 ## Exception hierarchy
 
-```
+```text
 \Exception
   └─ Terrarium\Exception              (base for everything the extension throws)
        ├─ Terrarium\TrapException     (the guest trapped: unreachable, OOB, bad indirect call)

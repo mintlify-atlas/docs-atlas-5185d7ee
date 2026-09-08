@@ -1,7 +1,7 @@
 ---
 title: "Terrarium::precompile() — Ahead-of-Time Guest Compilation"
 sidebarTitle: "precompile()"
-description: "Move Cranelift WASM compilation into your build pipeline with precompile(). Deployed processes load a native artifact instead of compiling, eliminating cold-start cost."
+description: "Ahead-of-time WASM compilation for deployment. Ship a native artifact, skip Cranelift at cold start, and remove the writable module-cache requirement."
 ---
 
 Constructing a guest compiles its WASM with Cranelift — one to two seconds for a

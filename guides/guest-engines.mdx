@@ -1,7 +1,7 @@
 ---
-title: "Choosing and Using a Guest Engine"
+title: "Terrarium Guest Engines: JavaScript, Python, PHP, TypeScript"
 sidebarTitle: "Guest Engines"
-description: "Compare the five bundled Terrarium guest engines — QuickJS-ng, Boa, RustPython, PHP, and TypeScript — and learn when to use each."
+description: "Compare the five bundled Terrarium guest engines — QuickJS-ng, Boa, RustPython, PHP, and TypeScript — and choose the right one for your use case."
 ---
 
 The guest language is decided purely by which `*_guest.wasm` file you load. The host PHP extension is completely language-agnostic — every method (`register()`, `eval()`, `check()`, `output()`, `types()`, etc.) is identical regardless of which engine you use. Swap the `.wasm` path and nothing else in your host code changes.

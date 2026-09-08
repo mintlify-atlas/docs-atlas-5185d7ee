@@ -1,7 +1,7 @@
 ---
-title: "Defining a Typed Capability SDK in PHP"
+title: "Defining a Typed Capability SDK for Sandboxed Guests"
 sidebarTitle: "Capability SDK"
-description: "Register PHP closures as a typed capability SDK that guest code can call. Learn naming rules, type inference from PHPDoc, and handle-based access for live objects."
+description: "Register PHP closures as a typed capability SDK that guest code can call. Learn naming rules, PHPDoc type inference, and handles for live host objects."
 ---
 
 `register()` is how you define the entire trust boundary. The guest can only call what you explicitly register — nothing else. There are no ambient APIs, no implicit globals, and no escape hatches: the flat dispatch table built from your `register()` calls is the only door between untrusted guest code and your host PHP process.
@@ -33,13 +33,14 @@ A capability named `user.fetch` is called as `user.fetch(...)` in the guest — 
 
 Every segment of the dotted name must be a valid identifier (letters, digits, `_`, not starting with a digit). Invalid names are rejected with an exception on `register()`.
 
-The following names are **reserved** by the bridge internals and are refused:
+The following top-level names are **reserved** by the bridge internals and are refused outright on `register()`:
 
-- Names beginning with `$` (e.g. `$out`, `$error`, `$names`, `$dts`, `$opts`) — these are internal reserved capabilities used by the prelude.
-- Names beginning with `__host` — reserved for bridge machinery.
+- `__host`, `_hostcall`, `__ns`, `_NS`, `__TerrariumNs` — used by the guest prelude's bridge machinery.
+
+Names containing a `$` segment (e.g. `$out`, `$error`, `$names`, `$dts`, `$opts`) are also rejected because `$`-prefixed identifiers are not valid identifiers for the segment regex — these are reserved internal capability slots used by the prelude.
 
 <Warning>
-Registering a capability whose top-level segment shadows a guest built-in (`console`, `Math`, `print`, `Promise`, etc.) will produce a warning. Because there is no synthetic root, top-level capability names become guest globals — a capability named `console` replaces the guest's own `console` object. Choose names that do not collide with the guest language's standard globals.
+Registering a capability whose top-level segment shadows a guest built-in (`console`, `Math`, `JSON`, `print`, `globalThis`, etc.) triggers a PHP `E_USER_WARNING`. Because there is no synthetic root, top-level capability names become guest globals — a capability named `console` replaces the guest's own `console` object. Choose names that do not collide with the guest language's standard globals.
 </Warning>
 
 ## Type inference
@@ -169,9 +170,9 @@ $wasm->register('db.query', function (int $handle, string $sql) use ($wasm): arr
 });
 
 // Guest code:
-//   db.query(0, "SELECT * FROM users")
+//   db.query(handle, "SELECT * FROM users")
 //
-// The integer 0 is the handle; the PDO object stays host-side.
+// The integer handle is opaque; the PDO object stays host-side.
 ```
 
 Granted objects are refcount-bumped so they survive PHP garbage collection while held. Call `revoke()` at the end of a session to release them:

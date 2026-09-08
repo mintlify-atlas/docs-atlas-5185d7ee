@@ -1,5 +1,5 @@
 ---
-title: "Get Started with Terrarium in 5 Minutes"
+title: "Quickstart: Run Your First Terrarium Sandbox in PHP"
 sidebarTitle: "Quickstart"
 description: "Create your first Terrarium sandbox: register PHP capabilities, run JavaScript guest code, and handle errors — in a single PHP file."
 ---
@@ -117,11 +117,11 @@ In this guide you will build a sandboxed JavaScript environment that calls PHP c
 The four-language example below registers an identical SDK once and evaluates the same program in every bundled guest engine. Only the `.wasm` path changes:
 
 ```php
-require __DIR__ . '/../lib/Terrarium.php';
+require 'vendor/autoload.php';
 
 use Terrarium\Terrarium;
 
-$wasm = fn (string $f) => __DIR__ . "/../tests/wasm/$f";
+$wasm = fn (string $f) => __DIR__ . "/guests/$f";
 
 // Register the same SDK on any Terrarium instance.
 function wire(Terrarium $g): void

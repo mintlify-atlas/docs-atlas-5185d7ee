@@ -1,7 +1,7 @@
 ---
-title: "Terrarium PHP API Overview"
+title: "Terrarium PHP API — Complete Public Method Reference"
 sidebarTitle: "Overview"
-description: "The Terrarium class exposes a single uniform API for all guest languages. Browse the full method reference for eval, check, register, types, handles, and errors."
+description: "Complete Terrarium API reference. One class, thirteen methods, all guest languages: eval, check, analyze, register, grant, types, manifest, and reset."
 ---
 
 `Terrarium\Terrarium` is the single public class you interact with — a thin, typed facade over the Rust-backed `Terrarium\Runtime` engine primitive. All classes live under the `Terrarium\` namespace. The guest's language is decided entirely by which `*_guest.wasm` file you load; every method below is identical across JavaScript, TypeScript, Python, and PHP guests.
