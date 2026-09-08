@@ -1,0 +1,110 @@
+---
+title: "grant(), resolve(), and revoke() — Capability Handles for Live Objects"
+sidebarTitle: "Handles"
+description: "Pass live PHP objects (DB connections, file handles) to guests as opaque integer handles. The object stays host-side; the guest only ever sees the handle."
+---
+
+Handles let you expose stateful, live PHP objects to the guest without actually passing them across the Wasm boundary. The object (a database connection, a file handle, an HTTP client) stays on the host side; the guest receives only an opaque integer it can pass back to a registered capability, which resolves the integer to the live object.
+
+## Methods
+
+### grant()
+
+```php
+grant(mixed $resource): int
+```
+
+Stores the object in a host-side handle table and returns an opaque integer handle. The object's reference count is bumped to prevent PHP garbage collection while the handle is held.
+
+### resolve()
+
+```php
+resolve(int $handle): mixed
+```
+
+Used inside a capability callback to retrieve the live object from the handle the guest passed in. Re-entrant: safe to call from inside a `host_call` callback.
+
+### revoke()
+
+```php
+revoke(int $handle): bool
+```
+
+Drops the handle from the table, releasing the reference. Returns `true` if the handle existed, `false` if it had already been revoked or was never granted.
+
+## How handles work
+
+The handle is just an opaque integer in the guest — not a pointer, just an ID the guest received and passes back. The guest cannot dereference it, cannot inspect the object it represents, and cannot form any pointer into host memory. The only thing a guest can do with a handle is hand it to a registered capability that calls `resolve()`.
+
+```
+PHP (host)                   Wasm guest (untrusted)
+─────────────────────────    ──────────────────────
+$pdo = new PDO(…);
+$h = $t->grant($pdo);  →     handle = 1   (opaque integer)
+
+$t->register('db.query',
+    fn($handle, $sql) =>      db.query(handle, "SELECT …")
+        $t->resolve($handle)   ↑ passes handle back
+          ->query($sql)
+          ->fetchAll()
+);
+```
+
+## PDO example
+
+```php
+$pdo = new PDO('sqlite:app.db');
+$h   = $t->grant($pdo);
+
+$t->register('db.query',
+    fn (int $handle, string $sql) => $t->resolve($handle)->query($sql)->fetchAll()
+);
+
+// The guest code calls db.query with the opaque handle:
+$results = $t->eval("db.query($h, 'SELECT id, name FROM users LIMIT 10')");
+```
+
+<Note>
+  The guest's copy of the handle integer is completely inert. It cannot dereference it, cannot form a pointer into host memory, and cannot call any method on it directly. The handle only becomes useful when passed to a registered capability that calls `resolve()` — and that capability is code you wrote.
+</Note>
+
+## Handle lifecycle
+
+<Steps>
+  <Step title="Grant handles before running guest code">
+    Call `grant()` once for each live object you want to make accessible. Store the returned handle integer for later use or pass it directly to the guest via `eval()`.
+  </Step>
+  <Step title="Resolve inside callbacks">
+    Inside a registered capability callback, call `resolve($handle)` with the integer the guest passed in to retrieve the live PHP object.
+  </Step>
+  <Step title="Revoke when done">
+    Call `revoke($handle)` when the object should no longer be accessible. This drops the reference from the handle table and allows the object to be garbage collected (if no other PHP references remain).
+  </Step>
+</Steps>
+
+**Handles survive `reset()`.** When you call `reset()` to drop the persistent shared Wasm instance, granted handles are **retained** — the handle table is part of the host context, not the guest instance. This means handles remain valid across instance resets. Explicitly revoke handles before reusing a Runtime for a different session to avoid leaking object references.
+
+<Tip>
+  Combine handles with `manifest()` to audit what resources are accessible to the guest at any point. `manifest()` lists all registered capability names; cross-referencing those with your granted handles gives you a complete picture of the guest's reachable surface.
+</Tip>
+
+## Multiple handles
+
+You can grant multiple objects and pass different handles to different capabilities:
+
+```php
+$readDb  = new PDO('sqlite:readonly.db');
+$writeDb = new PDO('sqlite:writable.db');
+
+$rh = $t->grant($readDb);
+$wh = $t->grant($writeDb);
+
+$t->register('db.read',  fn (int $h, string $sql)         => $t->resolve($h)->query($sql)->fetchAll());
+$t->register('db.write', fn (int $h, string $sql, ...$params) => $t->resolve($h)->prepare($sql)->execute($params));
+
+// Guest code only ever sees the integer handles, never the PDO objects themselves.
+$t->eval("
+    const rows = db.read($rh, 'SELECT id FROM items');
+    db.write($wh, 'INSERT INTO log (count) VALUES (?)', rows.length);
+");
+```

@@ -1,0 +1,188 @@
+---
+title: "eval(), check(), and analyze() — Running and Validating Guest Code"
+sidebarTitle: "eval / check / analyze"
+description: "Run guest source with eval(), validate it statically with check(), or extract JSON Schemas alongside diagnostics with analyze() — all with optional per-call timeouts."
+---
+
+`eval()`, `check()`, and `analyze()` are the primary execution and validation surface. All three accept an optional per-call `$timeoutMs` that overrides (or supplements) the constructor default for that call only.
+
+---
+
+## eval()
+
+```php
+eval(string $source, ?int $timeoutMs = null): mixed
+```
+
+Runs the guest source inside the sandbox and marshals the result back to PHP. A guest-program error (a thrown JS exception, a Python traceback, a failed TypeScript type-check) raises a `Terrarium\GuestException` whose message reads `Type: message (line N)`. Anything the guest printed via `console.log` (JS/TS) or `print`/`echo` (Python/PHP) is captured separately — read it with [`output()`](/api/types-output#output) after the call. The output buffer is cleared at the **start** of each `eval()` and preserved even if the call throws.
+
+<Note>
+  For JS/TS guests, if the result is a `Promise`, jobs are queued, or a promise reaction was registered during the eval, `eval()` raises a `Terrarium\GuestException` of type `AsyncIncomplete`. There is no event loop — a suspended program can never resume, so this failure is always surfaced loudly rather than returning a pending promise silently. Output printed before the suspension is preserved.
+</Note>
+
+```php
+use Terrarium\Terrarium;
+use Terrarium\GuestException;
+
+$wasm = new Terrarium('quickjs_guest.wasm', timeoutMs: 500, memoryLimit: 32 << 20);
+
+$wasm->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+echo $wasm->eval('user.fetch(42).roles.length');   // => 2
+```
+
+The TypeScript guest type-checks the source against the registered SDK's `.d.ts` **before** any code executes:
+
+```php
+$ts = new Terrarium('typescript_guest.wasm');
+$ts->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+$ts->eval('user.fetch("42")');
+// => Terrarium\GuestException: TS2345: Argument of type 'string' is not
+//    assignable to parameter of type 'number'. (line 1) — nothing executed
+
+echo $ts->eval('const u = user.fetch(42); `${u.name}: ${u.roles.join(", ")}`');
+// => "Ada: admin, dev"
+```
+
+---
+
+## check()
+
+```php
+check(string $source, ?int $timeoutMs = null): array
+```
+
+Statically validates guest source **without running it**. Returns every diagnostic as a structured entry; an empty array means the source passed. Nothing executes: no capability can fire and `output()` is untouched.
+
+**Return type:**
+
+```php
+/** @return list<array{message: string, type?: string, line?: int}> */
+```
+
+The validation depth is the strongest the guest's language offers:
+
+- **TypeScript guest** — full type-check against the registered SDK's `.d.ts`. `// @ts-nocheck` is **ignored** for explicit `check()` calls; you asked for the diagnostics.
+- **JavaScript, Python, PHP guests** — syntax and compile errors only. An empty array means "compiles", not "correct" — their type story is delivered via `types()` to the author's editor.
+
+With `syncOnly: true`, the TypeScript guest also lists every `async`, generator, and `Promise` construct as a `TSSyncOnly` diagnostic, ahead of the type diagnostics and regardless of `// @ts-nocheck`.
+
+```php
+$t->check('const u = user.fetch("42"); const n: number = u.name;');
+// [
+//   ['message' => "Argument of type 'string' is not assignable to parameter of type 'number'.", 'type' => 'TS2345', 'line' => 1],
+//   ['message' => "Type 'string' is not assignable to type 'number'.", 'type' => 'TS2322', 'line' => 1]
+// ]
+```
+
+`TSSchemaError` diagnostics from `typeArgumentSchemas` extraction also appear in `check()` output, so an existing validation path picks them up without changing its call.
+
+---
+
+## analyze()
+
+```php
+analyze(string $source, ?int $timeoutMs = null): array
+```
+
+The same static pass as `check()`, with everything the guest was additionally asked to extract:
+
+```php
+/** @return array{
+ *     diagnostics: list<array{message: string, type?: string, line?: int}>,
+ *     schemas: list<array{ordinal: int, callee: string, line: int, schema: string}>
+ * } */
+```
+
+- **`diagnostics`** — identical to what `check()` returns (same entries, same order).
+- **`schemas`** — empty unless the guest was constructed with `typeArgumentSchemas:`. One entry per matched call whose type argument could be expressed as JSON Schema.
+
+Nothing executes, exactly as with `check()`. A guest without the optional `analyze` export raises `Terrarium\Exception`; of the bundled guests only the **TypeScript guest** implements it.
+
+### Type-argument schema extraction
+
+Construct the guest with the callee names to extract from, then call `analyze()`:
+
+```php
+$ts = new Terrarium('typescript_guest.wasm', typeArgumentSchemas: ['ctx.model', 'ctx.agent']);
+
+$out = $ts->analyze('const v = ctx.agent<{ ok: boolean; note?: string }>({ /* ... */ }); v;');
+
+$out['schemas'];
+// [
+//   [
+//     'ordinal' => 0,
+//     'callee'  => 'ctx.agent',
+//     'line'    => 1,
+//     'schema'  => '{"type":"object","properties":{"ok":{"type":"boolean"},"note":{"type":"string"}},'
+//                . '"required":["ok"],"additionalProperties":false}'
+//   ]
+// ]
+```
+
+The guest walks the source for calls whose callee is a listed name **and** which carry exactly one type argument, resolves that argument with the TypeScript checker, and serialises it to JSON Schema. This inverts the usual arrangement: the author writes the *type* and the host derives the schema, rather than the author writing a schema literal.
+
+### Schema identity: ordinals, not line:column
+
+Each schema entry is identified by its **`ordinal`** — the 0-based index among matched calls in source order. Reformatting, renaming a binding, rewrapping arguments, and adding comments all move a line:column and none of them move an ordinal. The ordinal is positional and meaningful only within one version of one source, which is why it is re-derived on every analysis.
+
+A refused call (one whose type argument has no JSON Schema form) still consumes its ordinal and contributes a `TSSchemaError` diagnostic carrying that ordinal, so one inexpressible type argument cannot renumber its neighbours.
+
+**`line`** is a runtime bridge (the 1-based line of the call's start), not a second identity. It exists for consumers whose compiled artifact is immutable per version and must key their baked schemas by line at execution time. Moving a call moves its `line` and not one byte of its `schema`.
+
+### The expressible JSON Schema subset
+
+The subset is deliberately narrow — exactly what can be round-tripped back to the type the author wrote:
+
+| TypeScript | JSON Schema |
+|---|---|
+| `{ a: string; b?: number }` | `{"type":"object","properties":{…},"required":["a"],"additionalProperties":false}` |
+| `readonly` members | Identical (readonly says nothing about JSON) |
+| `T[]`, `readonly T[]`, `Array<T>` | `{"type":"array","items":…}` |
+| `string` / `number` / `boolean` / `null` | `{"type":"string"}` … (`number` stays `number`, never guessed as `integer`) |
+| `"yes"` / `42` / `true` | `{"const":"yes"}` |
+| `"a" \| "b"` | `{"type":"string","enum":["a","b"]}` |
+| `"a" \| 1 \| true` | `{"enum":[1,"a",true]}` (JSON-compatible, no single `type`) |
+| `string \| null` | `{"type":["string","null"]}` |
+| `A & B`, `Partial<T>`, `Pick<T, K>`, `Omit<T, K>` | Whatever plain object they reduce to |
+
+Everything else is **refused** with a `TSSchemaError` diagnostic naming the offending member path. Refused types include: `any`, `unknown`, `never`, `undefined` (including `T | undefined`), `void`, `bigint`, `symbol`, functions and methods, class instances, TypeScript `enum`, `Date`/`Map`/`Set`/`RegExp`, `Promise`, index signatures, tuples, template literal types, unresolved generic parameters, `{…} | null` and `T[] | null` (use `type: [x, "null"]` for nullable primitives), and recursive types.
+
+<Note>
+  `eval()` is completely unaffected by `typeArgumentSchemas`. Extraction is a static concern and never gates execution. `check()` reports `TSSchemaError` diagnostics too, so an existing validation path picks them up without changing its call.
+</Note>
+
+---
+
+## Per-call timeout interaction
+
+All three methods accept an optional `?int $timeoutMs` that controls this call's wall-clock budget independently of the constructor default.
+
+| Argument | Meaning |
+|---|---|
+| Omitted or `null` | Use the constructor default; guest setup remains outside that budget. |
+| Positive integer | Use this call's budget, including guest setup. Does not change the constructor default. |
+| `0` | No wall-clock timeout for this call; memory and fuel limits still apply. |
+| Negative integer | Throw `Terrarium\Exception` before running or clearing output. |
+
+<Warning>
+  A positive per-call timeout covers guest initialization too. If you pass the constructor's timeout value explicitly (e.g. `eval($source, timeoutMs: 1000)` on a Runtime constructed with `timeoutMs: 1000`), initialization is now inside that budget, not exempt from it. Pass `null` to preserve the setup exemption. Do **not** pass `0` to mean "use the default" — `0` means unbounded for that call.
+</Warning>
+
+Per-call timeouts use epoch interruption and cannot preempt PHP callbacks. Time spent inside a registered capability counts against the active budget; when control returns to guest code and the deadline has passed, `Terrarium\TimeoutException` is raised. Completed side effects inside callbacks are not rolled back.
+
+```php
+$rt = new \Terrarium\Runtime($wasmBytes, isolated: false);
+
+$diagnostics = $rt->check($source, timeoutMs: 5_000);
+
+if ($diagnostics === []) {
+    // Recompute your remaining budget before the next call.
+    $result = $rt->eval($source, timeoutMs: 3_000);
+}
+```

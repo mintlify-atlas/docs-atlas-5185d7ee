@@ -1,0 +1,214 @@
+---
+title: "TypeScript Guest: Type-Checked Code in the Sandbox"
+sidebarTitle: "TypeScript Guest"
+description: "Use the TypeScript guest to type-check every eval against your registered PHP SDK before execution, with syncOnly mode and JSON Schema extraction from type arguments."
+---
+
+The TypeScript guest runs the **real TypeScript compiler (tsc 6.0.3) inside the WASM sandbox**. The type environment is the capability environment: tsc checks every `eval()` against the `.d.ts` generated from your registered PHP SDK before a single line of guest code executes. A type error stops execution entirely and surfaces as a `Terrarium\GuestException` with the TS diagnostic code and source line. A clean check is a guarantee that the code will run — not merely that it is well-formed text.
+
+## Basic usage
+
+Load `typescript_guest.wasm`, register typed PHP capabilities, and call `eval()` as normal. The TypeScript compiler runs inside the sandbox on every call:
+
+```php
+use Terrarium\Terrarium;
+use Terrarium\GuestException;
+
+$ts = new Terrarium('/path/to/typescript_guest.wasm', timeoutMs: 10000);
+
+$ts->register('user.fetch',
+    /**
+     * Fetch a user by ID.
+     * @return array{name: string, roles: string[]}
+     */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+// --- wrong argument type: rejected before execution ---
+try {
+    $ts->eval('user.fetch("42")');
+} catch (GuestException $e) {
+    echo $e->getMessage();
+    // TS2345: Argument of type 'string' is not assignable to
+    // parameter of type 'number'. (line 1)
+}
+
+// --- wrong property access: caught the same way ---
+try {
+    $ts->eval('const emails: string[] = user.fetch(42).emails;');
+} catch (GuestException $e) {
+    echo $e->getMessage();
+    // TS2339: Property 'emails' does not exist on type
+    // '{ name: string; roles: string[]; }'. (line 1)
+}
+
+// --- correct program: type-checks, then runs ---
+echo $ts->eval(<<<'TS'
+    const u = user.fetch(42);
+    const roles: string[] = u.roles;
+    console.log("fetched", u.name);
+    `${u.name}: ${roles.join(", ")}`
+    TS);
+// => "Ada: admin, dev"
+
+echo $ts->output();  // "fetched Ada"
+```
+
+## How type checking works
+
+When you call `register()` on a TypeScript guest, the PHP library infers types from your closure's signature and PHPDoc (using Reflection and a recursive-descent PHPDoc parser) and emits a `.d.ts` declaration. The guest fetches this `.d.ts` via the reserved `$dts` capability on every eval.
+
+Inside the sandbox, tsc:
+1. Builds a `Program` from your source and the SDK `.d.ts`.
+2. Runs a full type-check against it. Any diagnostic raises a `Terrarium\GuestException` with the `TS<code>` type and the source line — **nothing executes**.
+3. If the check passes, types are **erased whitespace-preserving** using [ts-blank-space](https://github.com/bloomberg/ts-blank-space). The resulting JavaScript is positionally identical to the TypeScript you submitted: type annotations are replaced with spaces of the same width, so runtime error line numbers still match your original source exactly — no source-map indirection required.
+
+The guest's `lib` declares exactly what the QuickJS-ng engine implements — no `Intl`, no `Atomics`, no DOM, no Node. A clean `check()` means "this will run in the sandbox", not merely "this type-checks in a full TypeScript environment."
+
+<Note>
+Non-erasable TypeScript syntax — `enum`, `namespace` declarations — raises a `TSSyntaxError` diagnostic. These constructs cannot be whitespace-erased and are therefore unsupported by the guest.
+</Note>
+
+## check() — validate without executing
+
+`check()` runs the full static analysis pass and returns every diagnostic as data. Nothing executes — no capability can fire, and `output()` is untouched:
+
+```php
+$diagnostics = $ts->check('const u = user.fetch("42"); const n: number = u.name;');
+
+foreach ($diagnostics as $d) {
+    printf("%s (line %d): %s\n", $d['type'], $d['line'], $d['message']);
+}
+// TS2345 (line 1): Argument of type 'string' is not assignable to parameter of type 'number'.
+// TS2322 (line 1): Type 'string' is not assignable to type 'number'.
+```
+
+Each entry is `['message' => string, 'type' => string, 'line' => int]`. An empty array means the source passed all checks.
+
+`check()` ignores `// @ts-nocheck` — an explicit check call asks for the diagnostics unconditionally. The pragma is honoured by `eval()` (it is TypeScript's own opt-out mechanism), but not by `check()`, which is the host asking for validation.
+
+<Note>
+`TSEngineUnsupported` is always active and not skipped by `// @ts-nocheck`. It fires when the TypeScript checker accepts a construct that the QuickJS-ng sandbox engine cannot parse — currently `accessor` class members. This keeps `check()` meaning "this will run", not merely "this type-checks".
+</Note>
+
+## Synchronous-only mode (syncOnly: true)
+
+The WASM sandbox has **no event loop**. A program that suspends — an `async` function, a `Promise` reaction — can never resume. Terrarium catches this at run time with `AsyncIncomplete` on every QuickJS-based guest, but you can eliminate it entirely at **compile time** with the TypeScript guest.
+
+Pass `syncOnly: true` to the constructor to enable an AST walk that rejects asynchronous and generator syntax before execution:
+
+```php
+$ts = new Terrarium('/path/to/typescript_guest.wasm', syncOnly: true);
+
+$ts->eval('const rows = await db.query("…");');
+// Terrarium\GuestException: TSSyncOnly: `await` is not supported: this
+// environment is synchronous; SDK calls return values directly — remove
+// `await` and use the returned value. (line 1)
+```
+
+<Warning>
+`// @ts-nocheck` does **not** disable `syncOnly`. The pragma is TypeScript's opt-out from its own type checking — it reflects the author's preference about annotations. `syncOnly` is a host constraint: the sandbox genuinely cannot finish an asynchronous program, so the walk runs regardless. With `@ts-nocheck` the type information is unavailable, so promise detection falls back to shape-matching (`new Promise`, the identifier `Promise`, and members named `then`/`catch`/`finally`). Drop the pragma and matching is exact.
+</Warning>
+
+### What syncOnly bans
+
+`syncOnly: true` walks the parsed source and raises a `TSSyncOnly` diagnostic for every occurrence of:
+
+- `async` functions — declarations, expressions, arrow functions, class methods, object-literal methods
+- `await` — including top-level await
+- `for await`
+- Generator `function*` / `*method()` syntax
+- `yield`
+- The global `Promise` (constructed, named, or written in a type annotation)
+- Any expression whose type is a promise — including a capability that returns one
+- `.then()` / `.catch()` / `.finally()` on a promise-typed value
+
+`check()` lists **every** violation. `eval()` reports the **first** violation and counts the rest.
+
+```php
+$ts->check('const p = new Promise(() => {}); p.then(save); 42');
+// [
+//   ['type' => 'TSSyncOnly', 'line' => 1,
+//    'message' => '`Promise` cannot be used here: promises cannot settle in a synchronous guest …'],
+//   ['type' => 'TSSyncOnly', 'line' => 1,
+//    'message' => '`.then` / `.catch` / `.finally` cannot run here …'],
+// ]
+```
+
+Because the walk operates over the **checked** program (not a text search), prose is safe: a string literal containing `"we await your reply"`, a comment, or a property merely named `async` is not a violation. A class of your own called `Promise` is not the global one.
+
+<Tip>
+Enable `syncOnly: true` whenever the guest code is generated by an agent or LLM. It eliminates an entire class of hallucinated async patterns at compile time, before any SDK call can be made — giving you a clean `check()` that means "this will actually complete."
+</Tip>
+
+## Type-argument schema extraction (analyze())
+
+The TypeScript guest can derive a **JSON Schema** from the type argument of a named call site and return it alongside the diagnostics. This inverts the usual arrangement: the author writes a *type*, and the host gets the *schema*.
+
+Enable it by passing `typeArgumentSchemas` to the constructor with the callee names to extract from:
+
+```php
+$ts = new Terrarium('/path/to/typescript_guest.wasm',
+    typeArgumentSchemas: ['ctx.agent']);
+
+$out = $ts->analyze('const v = ctx.agent<{ ok: boolean; note?: string }>({ ... }); v;');
+
+$out['diagnostics'];  // same as check() — [] if clean
+
+$out['schemas'];
+// [
+//   [
+//     'ordinal' => 0,
+//     'callee'  => 'ctx.agent',
+//     'line'    => 1,
+//     'schema'  => '{"type":"object","properties":{"ok":{"type":"boolean"},"note":{"type":"string"}},'
+//               .  '"required":["ok"],"additionalProperties":false}',
+//   ]
+// ]
+```
+
+`analyze()` runs the same static pass as `check()` — nothing executes, no capability can fire. `diagnostics` is exactly what `check()` returns. `schemas` is populated only for callees listed in `typeArgumentSchemas` that carry exactly one type argument.
+
+### Schema identity by ordinal
+
+Each matched call is identified by its **0-based ordinal** (its position among all matched calls in source order), never by line:column. Reformatting, renaming a binding, rewrapping arguments, and adding comments all move a line:column and none of them move an ordinal.
+
+A refused call (a type argument with no JSON Schema representation) still **consumes its ordinal** — it contributes a `TSSchemaError` diagnostic and no `schemas` entry, so one inexpressible type cannot renumber its neighbours.
+
+`line` is provided as a sibling of `schema` (never inside it) so that consumers whose compiled artifacts are immutable per version can key their baked schemas by line at execution time.
+
+### Expressible types
+
+The schema subset is deliberately narrow — exactly what a type-level schema reader can turn back into the type the author wrote:
+
+| TypeScript | JSON Schema |
+|------------|-------------|
+| `{ a: string; b?: number }` | `{"type":"object","properties":{…},"required":["a"],"additionalProperties":false}` |
+| `T[]`, `readonly T[]`, `Array<T>` | `{"type":"array","items":…}` |
+| `string` / `number` / `boolean` / `null` | `{"type":"string"}` … |
+| `"yes"` / `42` / `true` | `{"const":"yes"}` |
+| `"a" \| "b"` | `{"type":"string","enum":["a","b"]}` |
+| `string \| null` | `{"type":["string","null"]}` |
+| `A & B`, `Partial<T>`, `Pick<T,K>`, `Omit<T,K>` | whatever plain object they reduce to |
+
+Everything else is **refused** with a `TSSchemaError` diagnostic naming the offending member path — `any`, `unknown`, `never`, `undefined`, `void`, `bigint`, functions, class instances, `Date`/`Map`/`Set`/`RegExp`, index signatures (`Record<string, T>`), tuples, unresolved generics, recursive types, and unions other than nullable primitives and literals.
+
+## AsyncIncomplete errors
+
+Even without `syncOnly: true`, the TypeScript (and QuickJS-ng) guest raises a `Terrarium\GuestException` of type `AsyncIncomplete` whenever an eval leaves the sandbox in an unfinished async state. Three independent checks fire after every eval:
+
+1. **The result is a `Promise`** — in any state.
+2. **Jobs are queued** — the eval returned a plain value but left work behind it.
+3. **A promise reaction was registered** — any `.then()` / `.catch()` / `.finally()` during the eval.
+
+```php
+$js->eval('(async () => { console.log("before"); await 1; save(); })()');
+// Terrarium\GuestException: AsyncIncomplete: asynchronous guest code cannot
+// complete: the program evaluated to a Promise, and the job queue is never
+// drained here, so its continuation never ran.
+
+echo $js->output();  // "before" — save() never ran
+```
+
+Output captured before the suspension point is preserved, as with any other guest error.
+
+There is one documented limitation: `await` uses an internal engine path rather than `Promise.prototype.then`, so a fire-and-forget async function suspended on a promise that never settles remains invisible to all three checks. `syncOnly: true` eliminates this case at compile time.

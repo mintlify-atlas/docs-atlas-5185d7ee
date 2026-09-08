@@ -1,0 +1,118 @@
+---
+title: "Terrarium Constructor — Load and Configure a Guest"
+sidebarTitle: "Constructor"
+description: "new Terrarium() loads a guest .wasm file and configures memory, timeout, stack, fuel, isolation, syncOnly, and precompiled options."
+---
+
+The constructor loads a guest from a `.wasm` file (or precompiled artifact) and configures all resource limits and behavioral options. Every limit defaults to unbounded; pass non-zero values to contain resource abuse. The guest's language is determined entirely by which `*_guest.wasm` file you point at — the constructor is identical regardless of language.
+
+## Signature
+
+```php
+new Terrarium(
+    string $path,
+    ?int $memoryLimit = null,
+    ?int $timeoutMs = null,
+    ?int $maxStack = null,
+    ?int $fuel = null,
+    bool $isolated = false,
+    bool $syncOnly = false,
+    ?array $typeArgumentSchemas = null,
+    bool $precompiled = false,
+)
+```
+
+## Parameters
+
+<ParamField path="$path" type="string" required>
+  Path to the guest `*_guest.wasm` file, or a precompiled `.cwasm` artifact when `$precompiled` is `true`. The constructor reads the file and hands the bytes to the Rust engine. Throws `\RuntimeException` if the file cannot be read.
+</ParamField>
+
+<ParamField path="$memoryLimit" type="int|null" default="null">
+  Byte cap on linear-memory growth. A `memory.grow` instruction that would exceed this limit raises `Terrarium\MemoryException`. Default: unbounded.
+</ParamField>
+
+<ParamField path="$timeoutMs" type="int|null" default="null">
+  Default wall-clock budget in milliseconds (epoch interruption) applied to each `eval()`, `check()`, and `analyze()` call. `null` (or `0` or negative) means unbounded at the constructor level. An explicit positive value on the call itself overrides this default for that call alone — and includes guest initialization in its budget. See [per-call timeout semantics](/api/eval-check-analyze#per-call-timeout-interaction) for the full interaction rules.
+</ParamField>
+
+<ParamField path="$maxStack" type="int|null" default="null">
+  Native call-stack cap in bytes. Hits are surfaced as a `Terrarium\TrapException`. Default: unbounded.
+</ParamField>
+
+<ParamField path="$fuel" type="int|null" default="null">
+  Deterministic instruction metering: the number of Wasm instructions the guest may execute per call before `Terrarium\TimeoutException` is raised. An alternative to (or complement of) `$timeoutMs` for reproducible runs. The budget is refilled before each entrypoint, so it is per-call, not lifetime. Only whether fuel metering is **enabled** is baked into the compiled module — if you use `Terrarium::precompile()`, you must pass the same fuel-enabled/disabled state on both ends.
+</ParamField>
+
+<ParamField path="$isolated" type="bool" default="false">
+  If `true`, each `eval()` runs in a fresh Wasm instance (hermetic mode). The default (`false`) shares one persistent instance across calls, which keeps engine-internal state warm — the TypeScript compiler context in particular — and is cheaper per call. Guest program globals do not accumulate across evals in either mode: the bundled guests run each eval in a fresh runtime. See [execution modes](/guides/execution-modes) for the full trade-off.
+</ParamField>
+
+<ParamField path="$syncOnly" type="bool" default="false">
+  If `true`, asks a compiling guest to reject asynchronous and generator syntax at compile time. The **TypeScript guest** enforces this by walking the parsed source and refusing every `async` function, `await` (including top-level), `for await`, `function*`/`*method()`, `yield`, and every use of a `Promise` — each reported as a `TSSyncOnly` diagnostic with the source line and a message naming the synchronous alternative. Guests without a compiler (JavaScript, Python, PHP) accept the option and ignore it; they are still covered by the run-time `AsyncIncomplete` guard on the QuickJS-based guests.
+</ParamField>
+
+<ParamField path="$typeArgumentSchemas" type="array|null" default="null">
+  A list of callee names — e.g. `['ctx.model', 'ctx.agent']` — for the TypeScript guest to extract JSON Schemas from type arguments in `analyze()`. Every callee must be a valid dotted identifier chain; invalid entries throw `\InvalidArgumentException` at construction time. Has no effect on `eval()` or `check()`. Only the TypeScript guest implements extraction; others ignore this option.
+</ParamField>
+
+<ParamField path="$precompiled" type="bool" default="false">
+  If `true`, `$path` is a precompiled artifact produced by `Terrarium::precompile()`. The artifact is loaded without re-compiling, making cold starts cheap by avoiding the one-to-two seconds of Cranelift compilation. **An artifact is native machine code and is trusted exactly as the extension binary itself** — Wasmtime does not validate it; it runs outside the WASM sandbox. Never load an artifact from user input or any untrusted source. See `Terrarium::precompile()` for the full trust model.
+</ParamField>
+
+## Resource limit interaction
+
+`$fuel` and `$timeoutMs` are independent and can be set simultaneously. They serve different purposes:
+
+- **`$timeoutMs`** uses epoch interruption — wall-clock time. It is non-deterministic across machines and loads, but reflects real elapsed time including I/O in callbacks.
+- **`$fuel`** counts Wasm instructions — deterministic and reproducible. The same guest program always exhausts the same budget. Fuel exhaustion raises `Terrarium\TimeoutException` just as a wall-clock deadline does.
+
+When both are set, whichever trips first wins. For reproducible sandboxing (testing, CI, replays) prefer `$fuel`; for user-facing latency budgets prefer `$timeoutMs`.
+
+## Engine sharing
+
+Constructing a second `Terrarium` from the same `.wasm` path (or the same artifact bytes when using `precompiled: true`) reuses the compiled Engine, Module, and InstancePre process-wide — the expensive Cranelift compilation happens at most once per process per guest binary. Only the Store, the Wasm instance, the resource limits, and the capability table are per-`Terrarium` object.
+
+## Typical production constructor
+
+```php
+$wasm = new Terrarium(
+    'quickjs_guest.wasm',
+    memoryLimit: 32 * 1024 * 1024,  // 32 MB
+    timeoutMs: 500,
+);
+```
+
+## AOT precompilation for cold-start performance
+
+```php
+// In your build pipeline:
+file_put_contents('quickjs_guest.cwasm', Terrarium::precompile('quickjs_guest.wasm'));
+
+// In the deployed process — no Cranelift compilation on load:
+$wasm = new Terrarium('quickjs_guest.cwasm', precompiled: true);
+```
+
+<Warning>
+  A precompiled artifact is native machine code for the exact extension build that produced it. Wasmtime does **not** validate it — loading one is equivalent to dynamically loading a shared library. Produce artifacts in your own build pipeline, ship them beside the extension binary, and **never** load one that came from user input, an upload, or any external source.
+</Warning>
+
+### `static precompile()` signature
+
+```php
+static Terrarium::precompile(
+    string $path,
+    ?int $maxStack = null,
+    ?int $fuel = null,
+    bool $portable = true,
+): string
+```
+
+Returns the raw artifact bytes. Write them to disk with `file_put_contents()`. Pass the same `$fuel` and `$maxStack` you intend to construct with — whether fuel metering is enabled is baked into the artifact and enforced on load. The `$portable` flag (default `true`) compiles for the architecture's baseline CPU rather than the build machine's specific features, so an artifact built on a CI runner with AVX-512 loads on a plainer Lambda host. Pass `false` only when the machine that precompiles is the machine that runs.
+
+| Constructor option | Baked into artifact? | Mismatch on load |
+|---|---|---|
+| `fuel` (enabled / not) | **Yes** — instruction metering is instrumented into the code | Refused: *"Module was compiled with fuel support but it is not enabled for the host"* (and vice versa) |
+| `fuel` (the budget value) | No — spent per call | Fine: any positive budget loads |
+| `maxStack` | No — a run-time engine setting | Fine: the loading Runtime's bound applies |
+| `memoryLimit`, `timeoutMs`, `isolated` | No — per-Store / per-call settings | Fine |

@@ -1,0 +1,114 @@
+---
+title: "Per-Call Timeouts for eval(), check(), and analyze()"
+sidebarTitle: "Per-Call Timeouts"
+description: "Override the constructor timeout for individual eval(), check(), and analyze() calls — cover guest initialization, handle unbounded and rejected values, and track remaining budget."
+---
+
+Both the PHP facade (`Terrarium\Terrarium`) and the engine primitive
+(`Terrarium\Runtime`) accept an optional `?int $timeoutMs = null` on `eval()`,
+`check()`, and `analyze()`. This lets you recompute the remaining time budget
+before each operation and pass a fresh value, rather than locking every call to
+a single constructor-level default.
+
+```php
+$rt = new Terrarium\Runtime($wasmBytes, isolated: false);
+
+$diagnostics = $rt->check($source, timeoutMs: 5000);
+
+// Recompute the enclosing operation's remaining budget before the next call.
+if ($diagnostics === []) {
+    $result = $rt->eval($source, timeoutMs: 3000);
+}
+```
+
+## Argument semantics
+
+| Argument | Meaning |
+|---|---|
+| Omitted or `null` | Use the constructor default; guest setup remains outside that budget. |
+| Positive integer | Use this call's budget, including guest setup. Does not change the default. |
+| `0` | No wall-clock timeout for this call; memory and fuel limits still apply. |
+| Negative integer | Throw `Terrarium\Exception` before running or clearing output. |
+
+<Warning>
+Do not pass zero to enforce a zero-time limit — zero means **unbounded**. Check the remaining budget yourself and refuse to start new work if it is exhausted. Passing a negative integer is the correct way to reject a call when no budget remains.
+</Warning>
+
+A positive timeout outside the supported monotonic clock range also throws
+`Terrarium\Exception`. The native `Runtime` rejects non-integer, non-null timeout
+values rather than treating failed conversions as an omitted argument. The PHP
+facade applies PHP's normal `?int` argument rules before forwarding the value.
+
+## What the deadline covers
+
+An explicit positive deadline starts at native method entry, after argument
+validation, before source encoding.
+
+**Included in the deadline:**
+
+- WASM start code
+- `_initialize` (guest module initialization)
+- Guest allocation
+- Compilation or checking of the submitted source
+- Execution
+- ABI result read and decode
+
+**Not included:**
+
+- Module loading and Cranelift compilation (constructor work)
+- `Engine` and `InstancePre` creation
+- PHP argument conversion
+- Final PHP result conversion
+- Timer teardown
+- PHP callbacks themselves (see note below)
+
+<Note>
+Time spent inside a PHP callback consumes the active budget. PHP callbacks cannot be preempted — the epoch-based interrupt mechanism can only fire between WASM instructions. When control returns from a callback, expiry raises `Terrarium\TimeoutException` before continuing guest execution. Cap blocking I/O (HTTP requests, database queries, retries) against your remaining budget separately.
+</Note>
+
+Fuel keeps its existing setup exemption and is refilled before each entrypoint,
+regardless of the per-call timeout.
+
+## Compatibility: constructor default vs per-call
+
+There is a subtle but important difference between using the constructor default
+and passing an explicit timeout:
+
+- **`new Runtime($bytes, timeoutMs: 1000)` followed by `eval($source)`** — the
+  1 000 ms timer starts _after_ instantiation and `_initialize` complete. Guest
+  setup is outside the budget.
+- **`eval($source, timeoutMs: 1000)`** — the 1 000 ms timer starts at method
+  entry and includes both guest initialization and execution in the same budget.
+
+This distinction also applies after `reset()` or fault recovery (where the shared
+instance is re-instantiated), and to each fresh instance in isolated mode. An
+initially unbounded Runtime (`new Runtime($bytes)` with no `timeoutMs`) fully
+supports a later timed call.
+
+## Limitations
+
+Per-call timeouts are **not an end-to-end hard deadline**. Several things are
+outside their scope:
+
+- **Epoch interruption only applies to running WASM.** Host memory allocation,
+  Cranelift compilation of the WASM module, and synchronous PHP callbacks cannot
+  be preempted by the epoch mechanism.
+- **Completed side effects are not rolled back.** If a capability fires and
+  modifies state before a timeout fires, that modification stands.
+- **Remaining budget is your responsibility.** Do not pass zero when a time
+  budget is exhausted — zero means unbounded. Track the remaining wall time
+  yourself and pass a negative value (or refuse the call entirely) when the
+  budget is gone.
+
+## Timer isolation
+
+Each call owns a cancellable timer that is joined before the call returns. Store
+deadlines are rearmed per call. Separate Runtimes constructed over the same guest
+WASM share one compiled `Engine` (immutable, carrying no per-call state), but
+every `Store` checks its own deadline independently — one timer cannot prematurely
+expire another Store.
+
+An unbounded or longer-deadline child call can still delay an expired parent while
+the parent is blocked in a PHP callback, but cross-Store expiry does not occur.
+**Recursive calls on a shared Runtime remain unsupported** — do not call `eval()`
+on a shared Runtime from inside a callback registered on that same Runtime.

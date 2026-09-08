@@ -1,0 +1,276 @@
+---
+title: "How Terrarium Infers Types from PHP Signatures"
+sidebarTitle: "Type Inference"
+description: "Terrarium reflects PHP function signatures and PHPDoc to emit .d.ts, .pyi, and .php stubs — so guest authors get a typed SDK without writing separate schemas."
+---
+
+Every time you call `register()`, Terrarium reads the registered closure via PHP's `ReflectionFunction` and a PHPDoc recursive-descent parser (`PhpDocType`), builds a neutral type AST, and stores it alongside the capability. That stored model drives `types('dts')`, `types('pyi')`, and `types('php')` — per-language type declarations emitted on demand. **The PHP type annotation is the schema.** No separate IDL, no hand-written type strings.
+
+<Note>
+Type inference works through reflection on the actual registered closure. The inferred types come directly from the PHP signature and docblock — there is no separate schema file or configuration required.
+</Note>
+
+---
+
+## What gets inferred
+
+The inference pipeline combines two sources: PHP's native type system (via `ReflectionFunction` and `ReflectionNamedType`) and a recursive-descent PHPDoc parser that handles richer shapes PHP's own syntax cannot express.
+
+| PHP annotation | Inferred type node | TypeScript output | Python output |
+|---|---|---|---|
+| `int`, `float` | `scalar(int)` / `scalar(float)` | `number` | `int` / `float` |
+| `string` | `scalar(string)` | `string` | `str` |
+| `bool` | `scalar(bool)` | `boolean` | `bool` |
+| `null` | `scalar(null)` | `null` | `None` |
+| `void` | `scalar(void)` | `void` | `None` |
+| `?int` | `nullable(scalar(int))` | `number \| null` | `Optional[int]` |
+| `int\|string` | `union([int, string])` | `number \| string` | `int \| str` |
+| `array` (bare, no annotation) | `list(any)` | `any[]` | `list[Any]` |
+| `@param int[] $xs` | `list(scalar(int))` | `number[]` | `list[int]` |
+| `@param array<int> $xs` | `list(scalar(int))` | `number[]` | `list[int]` |
+| `@return array{name: string, roles: string[]}` | `object(fields)` | `{ name: string; roles: string[] }` | `TypedDict` |
+| `@return array{user: array{id: int, name: string}}` | `object(nested)` | `{ user: { id: number; name: string } }` | nested `TypedDict` |
+
+The PHPDoc parser handles the full PHPStan/Psalm grammar for these shapes:
+
+- **Scalar aliases**: `integer` → `int`, `double` → `float`, `boolean` → `bool`, `non-empty-string` → `string`, `positive-int` → `int`, etc.
+- **Nullable shorthand**: `?T` and `T|null` both produce a `nullable` node.
+- **Generic syntax**: `array<V>`, `array<K, V>`, `list<V>`, `iterable<V>`.
+- **Trailing `[]`**: `int[]`, `string[][]`.
+- **Object shapes**: `array{name: string, roles?: string[], meta: array{...}}` — nested, optional fields, quoted string keys.
+- **Parenthesized groups**: `(int|string)[]`.
+
+---
+
+## Output formats
+
+The three output formats emit the same inferred type model in the idiom each guest language's author expects:
+
+### TypeScript (`.d.ts`)
+
+`$wasm->types('dts')` emits a TypeScript declaration. Each top-level namespace becomes a `declare const` with an object type; each flat (unnested) capability also becomes a `declare const` but typed as a function directly. There is no synthetic root — the declaration mirrors how the guest reaches the SDK at runtime.
+
+### Python (`.pyi`)
+
+`$wasm->types('pyi')` emits a Python stub. Object shapes are **hoisted into `TypedDict` classes** (named by a camel-cased hint derived from the capability path and parameter name), avoiding inline literals and making them reusable. Top-level namespaces become classes with `@staticmethod` methods; flat capabilities become module-level `def` stubs.
+
+### PHP (`.php` stub)
+
+`$wasm->types('php')` emits a PHP stub that describes what a PHP guest sees. Each namespace becomes a `final class Terrarium_<Name>` with typed methods and sub-namespace properties; flat capabilities become `/** @var \Closure(...): ... */`-annotated variables. Rich shapes (`array{...}`, `int[]`) that PHP's native type system cannot express ride in docblocks alongside the native type hints.
+
+---
+
+## Concrete example
+
+Given this SDK registration:
+
+```php
+$wasm->register('math.add', fn (int $a, int $b): int => $a + $b);
+
+$wasm->register('user.fetch',
+    /**
+     * Fetch a user by ID.
+     * @return array{name: string, roles: string[]}
+     */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+$wasm->register('log.info', function (string $m): void { /* capture */ });
+```
+
+**`$wasm->types('dts')`** produces:
+
+```typescript
+declare const log: {
+  readonly info: (m: string) => void;
+};
+declare const math: {
+  readonly add: (a: number, b: number) => number;
+};
+declare const user: {
+  /** Fetch a user by ID. */
+  readonly fetch: (id: number) => { name: string; roles: string[] };
+};
+```
+
+**`$wasm->types('pyi')`** produces:
+
+```python
+from typing import Any, Callable, Optional, NotRequired, TypedDict
+
+class UserFetchResult(TypedDict):
+    name: str
+    roles: list[str]
+
+class log:
+    @staticmethod
+    def info(m: str) -> None: ...
+
+class math:
+    @staticmethod
+    def add(a: int, b: int) -> int: ...
+
+class user:
+    # Fetch a user by ID.
+    @staticmethod
+    def fetch(id: int) -> UserFetchResult: ...
+```
+
+**`$wasm->types('php')`** produces:
+
+```php
+<?php
+// Generated by Terrarium -- the SDK visible to guest PHP. Do not edit.
+
+final class Terrarium_Log
+{
+    /**
+     * @param string $m
+     * @return void
+     */
+    public function info(string $m): void {}
+}
+
+final class Terrarium_Math
+{
+    /**
+     * @param int $a
+     * @param int $b
+     * @return int
+     */
+    public function add(int $a, int $b): int {}
+}
+
+final class Terrarium_User
+{
+    /**
+     * Fetch a user by ID.
+     * @param int $id
+     * @return array{name: string, roles: string[]}
+     */
+    public function fetch(int $id): array {}
+}
+
+/** @var Terrarium_Log $log */
+$log = null;
+/** @var Terrarium_Math $math */
+$math = null;
+/** @var Terrarium_User $user */
+$user = null;
+```
+
+---
+
+## PHPDoc descriptions
+
+The leading prose of a docblock — everything before the first `@tag` — is extracted as the capability's description. It is collapsed to a single line and surfaces as:
+
+- A JSDoc comment (`/** ... */`) in the `.d.ts` output
+- A `#` comment in the `.pyi` output
+- A docblock line in the `.php` stub output
+
+```php
+$wasm->register('user.search',
+    /**
+     * Search users by a free-text query, newest first.
+     * @param array{q: string, limit?: int} $query
+     * @return array{id: int, name: string}[]
+     */
+    fn (array $query): array => [['id' => 1, 'name' => 'Ada']]);
+```
+
+In the `.d.ts` output this becomes:
+
+```typescript
+declare const user: {
+  /** Search users by a free-text query, newest first. */
+  readonly search: (query: { q: string; limit?: number }) => { id: number; name: string }[];
+};
+```
+
+---
+
+## TypeScript type checking
+
+After every `register()` call, the PHP facade regenerates the `.d.ts` and pushes it to the Rust bridge via `set_types()`. The TypeScript guest fetches the current `.d.ts` via the reserved `$dts` capability at the start of each `eval()` and **type-checks the submitted source against it** using the real TypeScript compiler running inside the sandbox.
+
+The type environment is exactly the capability environment — no DOM lib, no Node lib, no global namespace pollution beyond what you registered. A type error raises `Terrarium\GuestException` with a `TS<code>` type and the exact source line, **before any guest code executes**:
+
+```php
+$ts = new Terrarium('typescript_guest.wasm');
+
+$ts->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+// Type mismatch — string passed where number expected
+$ts->eval('user.fetch("42")');
+// Terrarium\GuestException: TS2345: Argument of type 'string' is not
+// assignable to parameter of type 'number'. (line 1)
+
+// Type-correct — runs fine
+echo $ts->eval('const u = user.fetch(42); `${u.name}: ${u.roles.join(", ")}`');
+// => "Ada: admin, dev"
+```
+
+You can also lint without running using `check()`, which returns every diagnostic as data (`[]` = passed) and never executes guest code:
+
+```php
+$diagnostics = $ts->check('user.fetch("42")');
+// [['message' => "Argument of type 'string' is not assignable to parameter of type 'number'.",
+//   'type' => 'TS2345', 'line' => 1]]
+```
+
+---
+
+## Richer shapes with PHPDoc
+
+<Tip>
+Use `@return array{...}` PHPDoc for any capability that returns a structured map or record. Without it, a bare `array` return type infers as `any[]` in TypeScript and `list[Any]` in Python — losing all structure for the guest author.
+</Tip>
+
+The PHPDoc parser supports full nesting:
+
+```php
+$wasm->register('user.fetch',
+    /**
+     * Fetch a user record by ID, including roles and metadata.
+     * @return array{name: string, roles: string[], meta: array{active: bool, score?: float}}
+     */
+    fn (int $id): array => [
+        'name'  => "user-$id",
+        'roles' => ['admin'],
+        'meta'  => ['active' => true],
+    ]);
+```
+
+This produces in TypeScript:
+
+```typescript
+declare const user: {
+  /** Fetch a user record by ID, including roles and metadata. */
+  readonly fetch: (id: number) => {
+    name: string;
+    roles: string[];
+    meta: { active: boolean; score?: number }
+  };
+};
+```
+
+Optional fields (`score?: float` in the `@return` annotation) map to `score?: number` in TypeScript, `NotRequired[float]` in the Python `TypedDict`, and `score?: float` in the PHP docblock.
+
+<CardGroup cols={2}>
+  <Card
+    icon="layer-group"
+    title="Architecture"
+    href="/concepts/architecture"
+  >
+    The full PHP-Rust-Wasm stack: the host ABI, value marshaling, and the dispatch table.
+  </Card>
+  <Card
+    icon="shield"
+    title="Security Model"
+    href="/concepts/security-model"
+  >
+    How the three-layer defense works: WebAssembly isolation, the capability allowlist, and resource limits.
+  </Card>
+</CardGroup>

@@ -1,0 +1,136 @@
+---
+title: "Terrarium: WebAssembly Sandboxing for PHP"
+sidebarTitle: "Introduction"
+description: "Learn how Terrarium runs untrusted JavaScript, TypeScript, Python, or PHP inside PHP using WebAssembly isolation with a typed capability SDK."
+---
+
+Terrarium lets you run untrusted JavaScript, TypeScript, Python, or PHP directly inside your PHP process — sandboxed in WebAssembly — against a typed capability SDK you define as plain PHP functions. There are no containers to orchestrate, no microVMs to spin up, and no separate processes to manage. One PHP extension provides the isolation boundary, and the guest reaches exactly what you registered — nothing else.
+
+## What is Terrarium?
+
+Terrarium exposes a single, uniform class: `Terrarium\Terrarium`. You instantiate it with a path to a `.wasm` guest engine, register your PHP capabilities, and call `eval()` to run untrusted guest code. The guest's language — JavaScript, TypeScript, Python, or PHP — is decided entirely by which `*_guest.wasm` file you load. The host extension never changes.
+
+```php
+use Terrarium\Terrarium;
+
+$wasm = new Terrarium('quickjs_guest.wasm', timeoutMs: 500, memoryLimit: 32 << 20);
+
+$wasm->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+echo $wasm->eval('user.fetch(42).roles.length');   // => 2
+
+echo $wasm->types('dts');   // the typed .d.ts of your SDK ('pyi' for Python, 'php' for a PHP guest)
+```
+
+Swap `quickjs_guest.wasm` for `boa_guest.wasm`, `rustpython_guest.wasm`, or `php_guest.wasm` and the host code is completely unchanged. The guest author always works against the same typed SDK — a `.d.ts`, a `.pyi`, or a `.php` stub — inferred directly from your PHP signatures and PHPDoc.
+
+## How it works
+
+Terrarium is built on three layers:
+
+```
+PHP (trusted)  ──ext-php-rs──►  Rust bridge  ──wasmtime──►  WASM guest (untrusted)
+   register()                  dispatch table                a real language engine
+   eval()                      host_call(name, bytes)        SDK names as globals
+```
+
+1. **PHP defines the SDK.** You call `register()` with typed PHP closures. The allowlist of registered names is the entire trust boundary. The guest can reach nothing you did not register, and there is no synthetic root — a capability named `user.fetch` is called as `user.fetch(...)` in the guest.
+
+2. **The guest runs sandboxed in WebAssembly.** A real language engine compiled to WASM runs your guest source inside the sandbox. It sees your SDK as frozen globals installed from the registered names. Values cross the boundary as MessagePack over linear memory through a single `host_call` import. Memory, CPU, time, and stack limits bound resource usage.
+
+3. **Types flow to the guest author.** The SDK's types are inferred from your PHP signatures via Reflection and PHPDoc — including nested `array{…}` shapes — and emitted as a `.d.ts` (TypeScript), `.pyi` (Python), or `.php` stub. The TypeScript guest type-checks every `eval()` against that `.d.ts` before anything runs.
+
+## Security model
+
+WebAssembly is the hard, in-process isolation boundary. A real language engine compiled to WASM runs inside the sandbox's linear memory. Even a memory-corruption bug inside that engine cannot form a pointer outside its linear memory or invoke a syscall you didn't explicitly import. That containment is stronger than a natively-embedded interpreter, and it requires no outer microVM or gVisor for memory safety.
+
+The **capability allowlist** is the trust boundary for what guest code can reach. The guest sees only the PHP functions you explicitly `register()` — nothing else in your process, no filesystem, no network, no globals. Every registered name is validated; bridge-reserved names are rejected outright.
+
+**Resource limits** contain abuse. Three independent axes are available:
+
+- `memoryLimit` (bytes) — caps linear-memory growth; a `memory.grow` past the limit raises `MemoryException`
+- `timeoutMs` — wall-clock budget per operation via epoch interruption
+- `fuel` — deterministic instruction metering, an alternative to `timeoutMs` for reproducible runs; exhaustion raises `TimeoutException`
+
+<Note>
+  The honest residual: a bug in **Wasmtime itself** sits in the trust base. That's a small, Rust, memory-safe, heavily-fuzzed surface — a far better bet than trusting each bundled engine's own C or Rust codebase natively.
+</Note>
+
+## Guest languages
+
+Five engines are bundled. The same Rust bridge serves any language that targets WASM; the host extension never changes regardless of which guest you load.
+
+<CardGroup cols={2}>
+  <Card title="QuickJS-ng (JavaScript)" icon="js">
+    JavaScript via QuickJS-ng `v0.16.2` compiled to WASM through the WASI SDK. The reference guest — fast, lightweight, and written in C.
+  </Card>
+  <Card title="Boa (JavaScript)" icon="js">
+    JavaScript via Boa `0.20` — a pure-Rust JS engine compiled to WASM. No C toolchain required to build from source.
+  </Card>
+  <Card title="RustPython (Python)" icon="python">
+    Python via RustPython `0.5` — a pure-Rust Python interpreter compiled to WASM. Reach Python's syntax and standard library from PHP.
+  </Card>
+  <Card title="PHP (php-src in WASM)" icon="php">
+    Real `php-src` `8.3.14` via the embed SAPI — sandboxed PHP running *inside* PHP. The PHP guest accesses the SDK as proxy objects.
+  </Card>
+  <Card title="TypeScript (tsc + QuickJS-ng)" icon="code">
+    TypeScript `6.0.3` bytecode baked into the QuickJS-ng guest via Wizer snapshots. The real `tsc` type-checks every `eval()` against your SDK's `.d.ts` before it runs — a clean check means "this will run."
+  </Card>
+</CardGroup>
+
+<Tip>
+  The TypeScript guest is the most powerful option for code you control or want to validate rigorously. It type-checks guest source against the generated `.d.ts` of your registered SDK before executing anything, turning your PHP signatures into an enforced contract.
+</Tip>
+
+## Quick example
+
+Here's the full pattern in a single file: load a guest, define the SDK in PHP, run untrusted code, and inspect the result.
+
+```php
+require 'vendor/autoload.php';
+
+use Terrarium\Terrarium;
+
+// Load a guest engine and set resource limits.
+$wasm = new Terrarium('quickjs_guest.wasm', timeoutMs: 500, memoryLimit: 32 << 20);
+
+// Your SDK is plain, typed PHP — the signature is the schema.
+$wasm->register('user.fetch',
+    /**
+     * Fetch a user by ID.
+     * @return array{name: string, roles: string[]}
+     */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+// Untrusted guest code runs sandboxed and calls the SDK by its registered name.
+echo $wasm->eval('user.fetch(42).roles.length');   // => 2
+
+// Emit a typed declaration for the guest author.
+echo $wasm->types('dts');   // TypeScript .d.ts
+echo $wasm->types('pyi');   // Python .pyi stub
+```
+
+<Note>
+  The capability allowlist is the entire trust boundary. The guest can only call functions you explicitly passed to `register()` — it has no access to your filesystem, database, network, or any other PHP state.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Installation"
+    icon="download"
+    href="/installation"
+  >
+    Install the extension binary, PHP library, and guest WASM for your platform — Linux, macOS, Docker, or AWS Lambda.
+  </Card>
+  <Card
+    title="Quickstart"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Build your first Terrarium sandbox: register PHP capabilities, run JavaScript guest code, and handle errors in a single PHP file.
+  </Card>
+</CardGroup>

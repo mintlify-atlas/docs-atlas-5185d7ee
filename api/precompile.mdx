@@ -1,0 +1,173 @@
+---
+title: "Terrarium::precompile() — Ahead-of-Time Guest Compilation"
+sidebarTitle: "precompile()"
+description: "Move Cranelift WASM compilation into your build pipeline with precompile(). Deployed processes load a native artifact instead of compiling, eliminating cold-start cost."
+---
+
+Constructing a guest compiles its WASM with Cranelift — one to two seconds for a
+heavy guest like the TypeScript one, paid by the **first construction in each
+process**. Wasmtime's on-disk module cache normally absorbs that cost on long-lived
+processes, but on AWS Lambda the `$HOME` directory is read-only and each cold start
+is a fresh filesystem, so that cost is paid on every cold start.
+
+`Terrarium::precompile()` moves that compilation into your build pipeline. The
+deployed process loads a native artifact instead of compiling, which also removes
+the dependency on a writable cache directory entirely.
+
+## Signature
+
+```php
+static precompile(
+    string $path,
+    ?int $maxStack = null,
+    ?int $fuel = null,
+    bool $portable = true
+): string
+```
+
+<ParamField path="$path" type="string" required>
+  Path to the `.wasm` file to compile ahead of time. The method reads the file,
+  compiles it with Cranelift, and returns the artifact bytes as a string. Write
+  those bytes to disk with `file_put_contents()`.
+</ParamField>
+
+<ParamField path="$maxStack" type="int | null">
+  The same value you intend to use in the constructor. `maxStack` is a run-time
+  engine setting — it is **not** compiled into the artifact and is free to differ
+  between precompile and load. Passing it here documents intent and keeps both
+  ends of the build described in one place, but the **loading** Runtime's bound
+  is what actually applies.
+</ParamField>
+
+<ParamField path="$fuel" type="int | null">
+  **Critical:** whether fuel metering is **enabled** is compiled into the artifact.
+  Pass a non-null value here if and only if you will construct with `fuel:` set.
+  An artifact compiled with fuel metering enabled will be refused by a Runtime
+  constructed without it, and vice versa. The fuel budget itself is not baked in —
+  any positive budget loads fine against an artifact compiled with any other
+  positive budget.
+</ParamField>
+
+<ParamField path="$portable" type="bool">
+  Defaults to `true`. Compiles for the **baseline CPU** of this machine's
+  architecture, so the artifact loads on any host of that arch regardless of which
+  CPU extensions the build machine exposes. An artifact records the CPU features it
+  needs, and a host lacking one refuses it — so a CI runner with AVX-512 would
+  otherwise produce an artifact a plainer Lambda host cannot load. Pass `false`
+  only when the machine running `precompile()` is the machine that will load the
+  artifact.
+</ParamField>
+
+## Build pipeline usage
+
+Run `precompile()` in your build pipeline using **the same extension build you are
+deploying**. The artifact is tied to that exact Wasmtime version, target, and
+configuration — anything else is refused with a `Terrarium\Exception`.
+
+<Steps>
+  <Step title="Build step — generate the artifact">
+    Run with the same `.so` / `.dylib` that your deployed environment will load:
+
+    ```php
+    // Build step — run with the SAME extension build you are deploying:
+    file_put_contents('quickjs_guest.cwasm', Terrarium::precompile('quickjs_guest.wasm'));
+    ```
+  </Step>
+
+  <Step title="Ship the artifact alongside your code">
+    Treat the `.cwasm` as a build output — not a checked-in file. Regenerate it
+    whenever you upgrade the extension. The artifact is larger than the WASM it
+    came from (the TypeScript guest: 29 MB → 45 MB), so budget for package size.
+  </Step>
+
+  <Step title="Load with precompiled: true at runtime">
+    ```php
+    // Deployed:
+    $t = new Terrarium('quickjs_guest.cwasm', precompiled: true);
+    ```
+  </Step>
+</Steps>
+
+## Using tools/precompile-guests.php
+
+The repository ships `tools/precompile-guests.php`, which precompiles a whole set
+of guest WASM files in one shot and writes a `SHA256SUMS` file beside the
+artifacts. This is what the Terrarium release workflow runs to produce the
+precompiled Lambda artifacts:
+
+```sh
+# Without fuel metering:
+php -d extension=./terrarium.so tools/precompile-guests.php out/ tests/wasm/*.wasm
+
+# With fuel metering compiled in:
+php -d extension=./terrarium.so tools/precompile-guests.php --fuel out-fuel/ tests/wasm/*.wasm
+```
+
+The Lambda/Bref releases ship the TypeScript guest precompiled for each exact
+`.so` build as `terrarium-vX-phpY-lambda-bref-ARCH-precompiled-guests.zip`,
+compiled **without** fuel metering. Unpack `typescript_guest.cwasm` into
+`/var/task` and verify it against the `SHA256SUMS` inside the zip before use.
+
+## Performance numbers
+
+Measured on the TypeScript guest (release build, 4 CPUs), for the **first
+construction in a fresh process**:
+
+| Load method | Time |
+|---|---|
+| From `.wasm`, empty module cache | ~1.6 s |
+| From `.wasm`, warm module cache | ~0.33 s |
+| From precompiled artifact (no cache needed) | ~0.11 s |
+
+An artifact needs no module cache at all — it deserializes directly into a native
+module without re-invoking Cranelift.
+
+## fuel / maxStack compatibility matrix
+
+| Option | In the artifact? | Mismatch on load |
+|---|---|---|
+| `fuel` (enabled / not) | **yes** — metering is instrumented into the code | **refused**: *"Module was compiled with fuel support but it is not enabled for the host"* (and the converse) |
+| `fuel` (the budget) | no — spent per call | fine: any positive budget loads |
+| `maxStack` | no — a run-time engine setting | fine: the **loading** Runtime's bound applies |
+| `memoryLimit`, `timeoutMs`, `isolated` | no — per Store / per call | fine |
+
+## Trust and security
+
+<Warning>
+An artifact is **native machine code**. Wasmtime does **not** validate it. It runs with the host's full authority, **outside the WASM sandbox**. Treat it exactly as you treat `libterrarium.so` — produce it in your own build pipeline, ship it beside the extension, and **never** load one that came from user input, an upload, or any other untrusted source.
+
+Loading is always opt-in via `precompiled: true`. Nothing is auto-detected: passing raw WASM bytes to a `precompiled: true` Runtime is refused, and loading an artifact without `precompiled: true` is also refused. This explicit opt-in is a deliberate trust decision.
+</Warning>
+
+The artifact is bound to the **exact extension build** that produced it — Wasmtime
+version, target, and configuration. An artifact from a different build is refused
+with a `Terrarium\Exception` naming the mismatch. Wasmtime detects this reliably,
+but it is a build-pipeline invariant: regenerate the artifact whenever you upgrade
+the extension.
+
+## Runtime.precompile() for byte-level access
+
+`Terrarium\Terrarium::precompile()` reads a file path and delegates to the engine
+primitive. `Terrarium\Runtime::precompile()` takes **bytes** directly, for use
+when your WASM source does not live on disk:
+
+```php
+$artifact = Terrarium\Runtime::precompile($wasmBytes, fuel: 1);
+$rt       = new Terrarium\Runtime($artifact, precompiled: true, fuel: 5_000_000);
+```
+
+The same rules apply: `fuel` must match on both ends; `maxStack` and the budget
+are free to differ.
+
+## Module cache
+
+When loading raw WASM (without a precompiled artifact), Wasmtime maintains an
+on-disk module cache at `$XDG_CACHE_HOME/wasmtime`. Like the extension binary
+itself, this directory holds native code and must not be writable by anyone you
+would not trust to replace `libterrarium.so`. A deployment that loads precompiled
+artifacts never needs that cache, removing both the cold-start dependency and the
+permissions concern.
+
+Loading an artifact also goes through the same process-wide compiled-guest cache
+as WASM — keyed on the artifact bytes and their loader options — so a second
+`Runtime` over one artifact costs an instantiation, not a full deserialization.

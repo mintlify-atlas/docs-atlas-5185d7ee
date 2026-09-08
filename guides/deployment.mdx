@@ -1,0 +1,143 @@
+---
+title: "Deploying Terrarium to Production and AWS Lambda"
+sidebarTitle: "Deployment"
+description: "Deploy Terrarium to self-hosted Linux, Docker containers, and AWS Lambda via Bref — with ahead-of-time precompilation for cold-start-free serverless deployments."
+---
+
+Terrarium has three deployment targets: **self-hosted Linux**, **Docker containers**, and **AWS Lambda via Bref**. Each involves the same three pieces — the extension `.so`, the PHP library, and one or more guest `.wasm` files. The key concern in serverless environments is the **Cranelift compilation cost**: the first time a process loads a guest it compiles the `.wasm` to native code, which takes 1–2 seconds for a heavy guest. On Lambda, where each cold start is a fresh process and the on-disk module cache cannot persist, that cost is paid on every cold start — unless you precompile ahead of time.
+
+## Docker deployment
+
+Copy the extension `.so` into the image and add an `extension=` ini line. The PHP library installs via Composer; guest `.wasm` files ship alongside your code:
+
+```dockerfile
+FROM php:8.4-fpm
+
+# Copy the extension binary (download from the Terrarium GitHub releases)
+COPY terrarium-vX-php8.4-linux-x86_64.so /usr/local/lib/php/terrarium.so
+RUN echo 'extension=/usr/local/lib/php/terrarium.so' \
+      > /usr/local/etc/php/conf.d/terrarium.ini
+
+# Install the PHP library
+COPY composer.json composer.lock /var/www/html/
+RUN composer install --no-dev
+
+# Copy your application and guest engines
+COPY . /var/www/html/
+```
+
+Verify the extension loaded:
+
+```sh
+docker run --rm my-image php -r 'var_dump(class_exists("Terrarium\\Runtime"));'
+# bool(true)
+```
+
+Match the `.so` to your **PHP minor version** (`8.4` vs `8.5`) and **CPU architecture** (`x86_64` vs `aarch64`). The generic Linux build requires glibc ≥ 2.35; use the Lambda/Bref build (glibc 2.34) if you need broader compatibility.
+
+## AWS Lambda via Bref
+
+Bref mounts the runtime layer at `/opt`; the release artifacts follow Bref's layout (`extension_dir` at `/opt/bref/extensions`, ini files scanned from `/opt/bref/etc/php/conf.d/`). The same `.so` + ini work whether you go via a **Docker image** or a **Lambda layer**.
+
+Match the **architecture** (`arm64` for Graviton, `x86_64` otherwise) and **PHP version** to your Bref runtime. The Lambda build is compiled inside the Bref Amazon Linux 2023 image (glibc 2.34) — a generic Linux binary built on Ubuntu links against a newer glibc and will fail to load on Lambda.
+
+### Docker image
+
+Bake the released `.so` into a `FROM bref/php-XX:3` image:
+
+```dockerfile
+FROM bref/php-84:3
+
+COPY terrarium-vX-php8.4-lambda-bref-arm64.so /opt/bref/extensions/terrarium.so
+RUN echo 'extension=terrarium.so' \
+      > /opt/bref/etc/php/conf.d/ext-terrarium.ini
+
+COPY . /var/task
+```
+
+### Lambda layer
+
+The `lambda-bref-*.zip` release artifact is a ready Lambda layer containing the `.so` and the ini file in Bref's expected layout. Publish it and reference its ARN alongside the Bref runtime layer:
+
+```sh
+aws lambda publish-layer-version \
+  --layer-name terrarium-php84-arm64 \
+  --compatible-architectures arm64 \
+  --zip-file fileb://terrarium-vX-php8.4-lambda-bref-arm64.zip
+```
+
+Ship the PHP library alongside your code in `/var/task` via Composer. On Lambda the on-disk module cache cannot survive a cold start, so **do not ship the guest `.wasm` directly** — ship its precompiled artifact instead (see below) and construct with `precompiled: true`.
+
+Every Lambda build in a release ships with the TypeScript guest (the heaviest) already precompiled for that exact `.so`, as `terrarium-vX-phpY-lambda-bref-ARCH-precompiled-guests.zip`. Unpack `typescript_guest.cwasm` into `/var/task`, verify it against the included `SHA256SUMS`, and load it:
+
+```php
+$ts = new Terrarium\Terrarium(__DIR__ . '/typescript_guest.cwasm', precompiled: true);
+```
+
+## Precompiling guests for deployment
+
+`Terrarium::precompile()` moves Cranelift compilation into your **build pipeline**. It returns the compiled artifact bytes; the deployed process loads them with `precompiled: true` and only deserializes — no Cranelift work at run time, and no dependency on a writable cache directory.
+
+**Measured on the TypeScript guest (release build, 4 CPUs):**
+
+| Source | First construction cost |
+|--------|------------------------|
+| `.wasm` — empty module cache | **~1.6 s** |
+| `.wasm` — warm module cache | **~0.33 s** |
+| Precompiled artifact | **~0.11 s** |
+
+### Build step
+
+Run `precompile()` with the **same extension build you will deploy**:
+
+```sh
+# Run this in your CI/CD build pipeline, using the same .so you deploy
+php -d extension=./terrarium.so -r '
+    require "vendor/autoload.php";
+    file_put_contents(
+        "typescript_guest.cwasm",
+        Terrarium\Terrarium::precompile("typescript_guest.wasm")
+    );
+'
+```
+
+`tools/precompile-guests.php` does the same for a whole set of guests and writes a `SHA256SUMS` beside them — it is what the Terrarium release workflow runs:
+
+```sh
+# Precompile all guests without fuel metering
+php -d extension=./terrarium.so \
+    tools/precompile-guests.php out/ tests/wasm/*.wasm
+
+# Precompile with fuel metering enabled
+php -d extension=./terrarium.so \
+    tools/precompile-guests.php --fuel out-fuel/ tests/wasm/*.wasm
+```
+
+### Deployed usage
+
+```php
+// Load the precompiled artifact — skips Cranelift compilation entirely
+$t = new Terrarium\Terrarium(__DIR__ . '/typescript_guest.cwasm', precompiled: true);
+```
+
+<Warning>
+**Precompile rules — all four must hold:**
+
+1. **Generate it with the extension build that will load it.** An artifact is bound to the exact Wasmtime version, target, and configuration. Anything else is refused with a `Terrarium\Exception`. Regenerate whenever you upgrade the extension — treat the artifact as a build output, not a checked-in file.
+
+2. **Pass the same `fuel` setting on both ends.** Fuel metering is compiled into the artifact. An artifact built with `fuel:` set loads only into a Runtime with `fuel:` set, and vice versa. The budget value, `maxStack`, `memoryLimit`, and `timeoutMs` may differ freely.
+
+3. **Precompile for the architecture, not the build machine.** By default `precompile()` targets the baseline CPU of this machine's architecture (`portable: true`). A CI runner with AVX-512 would otherwise produce an artifact a plainer Lambda host cannot load. Pass `portable: false` only when the machine that precompiles is the machine that runs.
+
+4. **An artifact is native machine code — trust it like the `.so`.** Wasmtime does not validate it; the bytes run outside the WASM sandbox with the host's full authority. Produce it in your own build pipeline, ship it beside the extension, and **never load an artifact from user input, an upload, or any other untrusted source.** The `precompiled: true` flag is your explicit statement about those bytes.
+</Warning>
+
+## Module cache
+
+Wasmtime maintains an **on-disk module cache** at `$XDG_CACHE_HOME/wasmtime`. The extension enables this cache on every engine automatically: the first process to load a guest compiles it and writes the native code to the cache; subsequent processes load from the cache (~0.33 s) rather than recompiling from scratch (~1.6 s cold).
+
+The cache is useful on long-lived hosts (VMs, persistent containers) where `$HOME` is writable and persistent. On Lambda and other ephemeral environments, the cache directory is read-only or discarded between invocations, so it provides no benefit — precompiled artifacts are the right solution there.
+
+<Warning>
+The on-disk module cache holds **native machine code**, just like a precompiled artifact. Treat the cache directory as part of your trust boundary with the same permissions as the extension binary itself — it must not be writable by anyone you would not let replace the `.so`. A deployment that loads precompiled artifacts never needs the cache and can safely be deployed with no writable cache directory.
+</Warning>

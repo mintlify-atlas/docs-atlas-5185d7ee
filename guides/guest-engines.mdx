@@ -1,0 +1,232 @@
+---
+title: "Choosing and Using a Guest Engine"
+sidebarTitle: "Guest Engines"
+description: "Compare the five bundled Terrarium guest engines — QuickJS-ng, Boa, RustPython, PHP, and TypeScript — and learn when to use each."
+---
+
+The guest language is decided purely by which `*_guest.wasm` file you load. The host PHP extension is completely language-agnostic — every method (`register()`, `eval()`, `check()`, `output()`, `types()`, etc.) is identical regardless of which engine you use. Swap the `.wasm` path and nothing else in your host code changes.
+
+<Tabs>
+  <Tab title="QuickJS-ng (JavaScript)">
+    **Version:** v0.16.2 · **Language:** JavaScript · **File:** `quickjs_guest.wasm`
+
+    QuickJS-ng is the **reference guest** — the engine all other guests are measured against. It is compiled from C using the WASI SDK (reactor mode) and is the best-tested, fastest, and most feature-complete JavaScript guest.
+
+    ```php
+    use Terrarium\Terrarium;
+
+    $js = new Terrarium('/path/to/quickjs_guest.wasm', timeoutMs: 500);
+
+    $js->register('math.add', fn (int $a, int $b): int => $a + $b);
+
+    echo $js->eval('math.add(2, 3)');  // => 5
+    ```
+
+    **When to use:** the default choice for JavaScript. Use it unless you have a specific reason to prefer Boa (e.g. no C toolchain available in your build environment, or you need a pure-Rust dependency graph).
+
+    **Error reporting:** full source line in every guest error message.
+
+    **syncOnly:** the `syncOnly: true` constructor option is accepted but enforced at run time only (via `AsyncIncomplete`). Use the TypeScript guest if you need compile-time enforcement.
+  </Tab>
+
+  <Tab title="Boa (JavaScript)">
+    **Version:** 0.20 · **Language:** JavaScript · **File:** `boa_guest.wasm`
+
+    Boa is a pure-Rust JavaScript engine compiled to `wasm32-unknown-unknown`. Because it requires no C toolchain, it can be built with a plain `rustup target add wasm32-unknown-unknown` — no WASI SDK required.
+
+    ```php
+    use Terrarium\Terrarium;
+
+    $js = new Terrarium('/path/to/boa_guest.wasm', timeoutMs: 2000);
+
+    $js->register('user.fetch',
+        /** @return array{name: string, roles: string[]} */
+        fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+    echo $js->eval('user.fetch(42).roles.length');  // => 2
+    ```
+
+    **When to use:** when you need a pure-Rust dependency graph or cannot use the WASI SDK in your build pipeline, and are running JavaScript (not TypeScript).
+
+    <Note>
+      Boa's public API does not expose a reliable source span, so guest errors from Boa show the error type and message but **no source line number**.
+    </Note>
+
+    **syncOnly:** the option is accepted but currently inert for Boa — there is no AST walker to enforce it. The runtime `AsyncIncomplete` guard (from QuickJS) does not apply to Boa either. Use the TypeScript guest if you need compile-time async enforcement.
+  </Tab>
+
+  <Tab title="RustPython (Python)">
+    **Version:** 0.5 · **Language:** Python · **File:** `rustpython_guest.wasm`
+
+    RustPython is a pure-Rust Python interpreter compiled to `wasm32-unknown-unknown`. Guest Python code accesses capabilities using the same dotted names, but results from object-shaped capabilities come back as dict-like values accessed with `u['key']` syntax.
+
+    ```php
+    use Terrarium\Terrarium;
+
+    $py = new Terrarium('/path/to/rustpython_guest.wasm', timeoutMs: 5000);
+
+    $py->register('user.fetch',
+        /** @return array{name: string, roles: string[]} */
+        fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+    $py->register('math.add', fn (int $a, int $b): int => $a + $b);
+
+    echo $py->eval(<<<'PY'
+        u = user.fetch(42)
+        "%s / roles=%d / add=%d" % (u["name"], len(u["roles"]), math.add(2, 3))
+        PY);
+    // => "Ada / roles=2 / add=5"
+    ```
+
+    **When to use:** when the untrusted code is Python. `types('pyi')` generates a `.pyi` stub (with `TypedDict`s for object shapes) that you can give to Python guest authors for a typed SDK experience.
+
+    **syncOnly:** the option is accepted but inert. RustPython has no compiler to enforce it against.
+  </Tab>
+
+  <Tab title="PHP">
+    **Version:** PHP 8.3.14 · **Language:** PHP · **File:** `php_guest.wasm`
+
+    The PHP guest is real **php-src** compiled via its embed SAPI (`php_embed_init` / `zend_eval_stringl`), cross-compiled with the WASI SDK — sandboxed PHP running **inside PHP**. The guest reaches the SDK through proxy objects: each registered namespace segment becomes a `$variable` of a proxy class, and methods on that object map to registered capabilities.
+
+    ```php
+    use Terrarium\Terrarium;
+
+    $phpGuest = new Terrarium('/path/to/php_guest.wasm', timeoutMs: 5000);
+
+    $phpGuest->register('math.add', fn (int $a, int $b): int => $a + $b);
+    $phpGuest->register('user.fetch',
+        /** @return array{name: string, roles: string[]} */
+        fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+    echo $phpGuest->eval(<<<'GUEST'
+        $u = $user->fetch(42);
+        return sprintf("%s / roles=%d / add=%d",
+            $u["name"], count($u["roles"]), $math->add(2, 3));
+        GUEST);
+    // => "Ada / roles=2 / add=5"
+    ```
+
+    A top-level `return` in the guest source is the eval result. `echo`/`print` is captured into `output()`. Uncaught exceptions and PHP fatal errors become a `Terrarium\GuestException`.
+
+    **Nested namespaces** work naturally: `$api->v1->hello(...)` for a capability registered as `api.v1.hello`. A flat capability (`ping`) is available as an invokable `$ping()`.
+
+    `types('php')` generates a PHP stub with typed proxy classes that describes exactly what guest PHP code can call.
+
+    **syncOnly:** the option is accepted but inert.
+  </Tab>
+
+  <Tab title="TypeScript">
+    **Language:** TypeScript · **File:** `typescript_guest.wasm`
+
+    The TypeScript guest is QuickJS-ng v0.16.2 with the real TypeScript compiler **tsc 6.0.3** embedded as precompiled QuickJS bytecode. Every `eval()` is **type-checked against the `.d.ts` generated from your registered SDK** before any code executes.
+
+    ```php
+    use Terrarium\Terrarium;
+
+    $ts = new Terrarium('/path/to/typescript_guest.wasm', timeoutMs: 10000);
+
+    $ts->register('user.fetch',
+        /** @return array{name: string, roles: string[]} */
+        fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+    // Type error caught before execution:
+    $ts->eval('user.fetch("42")');
+    // => Terrarium\GuestException: TS2345: Argument of type 'string' is not
+    //    assignable to parameter of type 'number'. (line 1)
+
+    // Correct call runs fine:
+    echo $ts->eval('const u = user.fetch(42); `${u.name}: ${u.roles.join(", ")}`');
+    // => "Ada: admin, dev"
+    ```
+
+    The TypeScript guest is **Wizer-snapshotted**: the compiler context (tsc + the parsed `lib.es2020` `.d.ts` chain) is pre-initialized at build time and baked into the module's data segments, so every eval starts warm — including every fresh isolated-mode instance.
+
+    **syncOnly:** `syncOnly: true` is enforced at **compile time** by a full AST walk. The TypeScript guest bans `async`, `await`, `for await`, `function*`, `yield`, and every use of `Promise` before anything executes. See the [TypeScript Guest guide](/guides/typescript-guest) for full details.
+
+    For more on type checking, `check()`, `analyze()`, and `syncOnly`, see the [TypeScript Guest guide](/guides/typescript-guest).
+  </Tab>
+</Tabs>
+
+## Swapping engines
+
+Because the host API is identical for all engines, you can run the same registered SDK against every guest in a loop — only the `.wasm` path and the guest source dialect change:
+
+```php
+use Terrarium\Terrarium;
+
+$wasm = fn (string $f) => __DIR__ . "/wasm/$f";
+
+$log = [];
+function wire(Terrarium $g, array &$log): void
+{
+    $g->register('math.add', fn (int $a, int $b): int => $a + $b);
+    $g->register('user.fetch',
+        /** @return array{name: string, roles: string[]} */
+        fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+    $g->register('log.info', function (string $m) use (&$log): void { $log[] = $m; });
+}
+
+$jsSrc = <<<'JS'
+    const u = user.fetch(42);
+    log.info(`fetched ${u.name}`);
+    `${u.name} / roles=${u.roles.length} / add=${math.add(2, 3)}`
+    JS;
+
+$pySrc = <<<'PY'
+    u = user.fetch(42)
+    log.info("fetched " + u["name"])
+    "%s / roles=%d / add=%d" % (u["name"], len(u["roles"]), math.add(2, 3))
+    PY;
+
+$phpSrc = <<<'GUEST'
+    $u = $user->fetch(42);
+    $log->info("fetched " . $u["name"]);
+    return sprintf("%s / roles=%d / add=%d", $u["name"], count($u["roles"]), $math->add(2, 3));
+    GUEST;
+
+foreach ([
+    'QuickJS-ng (JavaScript)' => [$wasm('quickjs_guest.wasm'), $jsSrc,  2000],
+    'Boa (JavaScript)'        => [$wasm('boa_guest.wasm'),     $jsSrc,  2000],
+    'RustPython (Python)'     => [$wasm('rustpython_guest.wasm'), $pySrc, 5000],
+    'php-src (PHP-in-PHP)'    => [$wasm('php_guest.wasm'),     $phpSrc, 5000],
+] as $engine => [$path, $src, $budget]) {
+    $g = new Terrarium($path, timeoutMs: $budget);
+    wire($g, $log);
+    echo "$engine: ", $g->eval($src), "\n";
+}
+```
+
+## Guest access syntax per language
+
+The same registered capability `user.fetch` and `math.add` is called differently in each guest language:
+
+| Language | Syntax |
+|----------|--------|
+| JavaScript (QuickJS-ng, Boa) | `user.fetch(42)` · `math.add(2, 3)` |
+| TypeScript | `user.fetch(42)` · `math.add(2, 3)` |
+| Python | `user.fetch(42)` · `math.add(2, 3)` (results: `u["name"]`) |
+| PHP guest | `$user->fetch(42)` · `$math->add(2, 3)` |
+
+In the Python guest, object-shaped return values come back as dict-like objects accessed with `u["key"]` syntax. In the PHP guest, each top-level namespace segment is a proxy object variable (`$user`, `$math`), and nested namespaces chain naturally (`$api->v1->hello(...)`). A flat capability (e.g. `ping`) is available as a plain invokable `$ping()`.
+
+## Performance characteristics
+
+The main cold-start cost is **Cranelift compilation** — compiling the `.wasm` to native code the first time a process loads a guest. Wasmtime's on-disk module cache (`$XDG_CACHE_HOME/wasmtime`) absorbs this cost across process restarts where the cache directory is writable and persistent. For deployments where it is not (e.g. AWS Lambda cold starts), use precompiled artifacts — see the [Deployment guide](/guides/deployment).
+
+| Engine | Cold compile (fresh process) | Notes |
+|--------|------------------------------|-------|
+| QuickJS-ng | ~100–200 ms | Reference guest; C-compiled |
+| Boa | ~100–200 ms | Pure Rust |
+| RustPython | ~200–400 ms | Pure Rust |
+| PHP | ~500 ms–1 s | Real php-src; largest guest |
+| TypeScript | ~1.6 s (from wasm, cold cache) | Heavy compiler; use precompiled artifacts in production |
+
+Once loaded, **warm eval times** depend on the engine:
+
+- **QuickJS-ng / Boa / RustPython / PHP:** each eval starts a fresh language runtime (hermetic per eval). Engine bring-up is very fast.
+- **TypeScript (shared mode):** the compiler context (tsc + lib parse) is kept warm between evals — repeat checks cost ~5 ms. In shared mode, the first eval after construction is ~20 ms (Wizer pre-initialized).
+- **TypeScript (isolated mode):** each eval starts with a fresh Wasm instance, but the Wizer snapshot means the compiler is already warm — **~23 ms/call** instead of ~500 ms without snapshotting.
+
+<Note>
+Boa and RustPython both accept the `syncOnly: true` constructor option but ignore it — they have no compiler AST to enforce it against. Only the TypeScript guest enforces `syncOnly` at compile time. On the QuickJS-based guests (QuickJS-ng and TypeScript), the runtime `AsyncIncomplete` guard always fires if the eval produces a Promise, leaves jobs queued, or registers a promise reaction.
+</Note>

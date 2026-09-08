@@ -1,0 +1,149 @@
+---
+title: "Shared vs Isolated Execution Modes"
+sidebarTitle: "Execution Modes"
+description: "Compare Terrarium's shared and isolated execution modes — when to use each, how fault recovery works, and what two Terrarium objects over the same wasm share."
+---
+
+The `isolated` constructor flag controls the **lifecycle of the underlying Wasm instance** — not guest program state, which is always fresh per eval regardless of mode. Understanding the distinction between these two things is the key to choosing the right mode.
+
+```php
+use Terrarium\Terrarium;
+
+$shared   = new Terrarium('guest.wasm');                  // default: one persistent instance
+$isolated = new Terrarium('guest.wasm', isolated: true);  // a fresh instance per eval()
+```
+
+## Guests are hermetic per eval
+
+Every bundled guest runs each `eval()` in a **fresh language runtime**. QuickJS-ng, Boa, and the TypeScript guest create a new JS runtime per eval; RustPython creates a new interpreter; the PHP guest starts a fresh execution. Guest *program* state — a JS `globalThis` assignment, a Python name binding, a PHP `$GLOBALS` entry — **does not carry from one `eval()` to the next** in either mode:
+
+```php
+$js = new Terrarium('quickjs_guest.wasm');   // shared mode
+
+$js->eval('globalThis.x = 1;');
+echo $js->eval('typeof globalThis.x;');   // => "undefined"  (fresh runtime)
+```
+
+This is the key difference from a classic embedded interpreter. Mode does not change this. What it changes is the Wasm *instance* that wraps that runtime.
+
+## Shared mode (default)
+
+One Wasm instance for the object's life. Each `eval()` still runs in its own fresh guest runtime. The benefits are **cost and warmth**, not state persistence:
+
+- **No re-instantiation per call.** The Wasm instance is constructed once and reused.
+- **Engine-internal caches survive between evals.** This matters most for the TypeScript guest: its compiler context (tsc + the parsed `lib.es2020` `.d.ts` chain + the last `Program`) is kept warm, so repeat checks cost **~5 ms** instead of the cold **~500 ms**.
+
+Use shared mode for almost every workload. It is the cheapest option and already gives you inter-eval isolation of guest program state for free.
+
+```php
+$wasm = new Terrarium('quickjs_guest.wasm', timeoutMs: 500, memoryLimit: 32 << 20);
+
+$wasm->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+echo $wasm->eval('user.fetch(42).roles.length');  // => 2
+echo $wasm->eval('user.fetch(99).name');          // => "Ada"  (fresh runtime, same instance)
+```
+
+## Isolated mode
+
+A brand-new Wasm instance per `eval()`, discarded afterward — a guaranteed-fresh linear memory each call. Guest program state is fresh either way; what isolated mode adds is **defense-in-depth**: no cross-call reuse of the engine's linear memory at all, so not even an engine-level memory-corruption bug can carry forward from one call to the next.
+
+```php
+$wasm = new Terrarium('quickjs_guest.wasm', isolated: true);
+```
+
+Instantiation is cheap because the module is compiled once and each call instantiates from a pre-resolved `InstancePre`. The trade-off is that engine-internal warm state is rebuilt per call. For the TypeScript guest this would normally cost ~500 ms of compiler bring-up per call — which is why it is **Wizer-snapshotted**: the warmed compiler heap is baked into the module, so a fresh isolated instance starts warm at **~23 ms/call** instead.
+
+## Comparison
+
+| Aspect | Shared (default) | Isolated (`isolated: true`) |
+|--------|------------------|-----------------------------|
+| Wasm instance | one, reused for the object's life | fresh per `eval()`, discarded after |
+| Guest program state across evals | gone (fresh runtime per eval) | gone (fresh runtime per eval) |
+| Engine-internal warm state | kept (e.g. TS compiler context) | rebuilt each call |
+| Linear memory per call | reused | fresh |
+| Cost | lower | per-instantiation overhead |
+| Defense-in-depth | standard | full: no cross-call memory reuse |
+
+## Fault recovery
+
+A sandbox-level fault — a Wasm trap, a timeout, a memory-limit hit — **poisons the instance**. Terrarium drops it automatically:
+
+- **Shared mode:** the next `eval()` instantiates a fresh instance and re-warms the engine.
+- **Isolated mode:** recovery is free — each call was already using a fresh instance.
+
+A **guest-program error** (the `$error` sentinel — a thrown JS exception, a Python traceback, a failed TypeScript type-check) is *not* a fault. It does not poison the instance, and the same Runtime can be retried immediately.
+
+```php
+use Terrarium\GuestException;
+use Terrarium\TimeoutException;
+
+try {
+    $wasm->eval($untrustedSource);
+} catch (TimeoutException $e) {
+    // Sandbox fault — instance dropped; next eval re-instantiates
+} catch (GuestException $e) {
+    // Guest program error — instance still alive, can retry
+    echo $e->getMessage();
+}
+```
+
+## What two Terrarium objects share
+
+Constructing a second `Terrarium` over the same `.wasm` bytes does **not** compile it again. Terrarium maintains a process-wide cache keyed on (bytes + engine options). Identical bytes under identical options resolve to one shared `Engine`, `Module`, and `InstancePre` — so the second construction costs a byte hash plus an instantiation rather than another Cranelift compile (for the 28 MB TypeScript guest: ~8 ms vs ~300 ms for deserialization, or ~1.6 s from wasm cold).
+
+What is **shared** (immutable, carries no tenant state):
+
+- `Engine`, `Module`, `InstancePre` — the compiled code
+
+What each `Terrarium` keeps **entirely for itself**:
+
+- `Store` and `Instance` — its own linear memory
+- `memoryLimit`, `timeoutMs` deadlines, fuel budget
+- Capability dispatch table (registered callables)
+- Handle table (granted objects)
+- Output buffer
+
+Two `Terrarium` objects over the same guest can register *different* callables under the *same* name and each call reaches its own. A timeout or trap on one leaves the other running. Neither can see the other's output or capabilities.
+
+## reset()
+
+`reset()` drops the persistent shared instance so the next `eval()` re-instantiates the guest (re-warming any engine-internal state, e.g. the TypeScript compiler context). It is a no-op in isolated mode — every call is already fresh. Returns `true` if an instance existed.
+
+```php
+$rt = new \Terrarium\Runtime($wasmBytes, isolated: false);
+$diagnostics = $rt->check($source, timeoutMs: 5000);
+if ($diagnostics === []) {
+    $result = $rt->eval($source, timeoutMs: 3000);
+}
+$rt->reset();  // drops the instance; retains Engine/InstancePre
+```
+
+Reset retains:
+- Registered callbacks and capability declarations
+- Compile options (`syncOnly`, `typeArgumentSchemas`)
+- Captured output buffer
+- Granted handles
+
+Reset does **not** wipe host context. For session reuse across tenants, replace fixed callback closures to release captured context, refresh declarations and options, and explicitly `revoke()` any handles before reusing the Runtime.
+
+<Warning>
+Never call `reset()` from inside a shared callback (a capability closure). Tearing down the instance while it is executing is unsupported and will produce incorrect behaviour.
+</Warning>
+
+## Strongest isolation
+
+For the strongest per-tenant isolation boundary, create a **new `Terrarium` per tenant**. Each object gets its own `Store`, instance, linear memory, limits and deadlines, and its own capability table, handle table, and output buffer. The compiled code behind it is shared with any other `Terrarium` over the same guest bytes, but that shared code is immutable and carries no tenant state.
+
+```php
+function handleRequest(string $tenantId, string $source): mixed
+{
+    // A fresh Terrarium per request — its own Store, instance, limits,
+    // capabilities, and handles. The compiled module is shared process-wide.
+    $wasm = new Terrarium('guest.wasm', memoryLimit: 16 << 20, timeoutMs: 200);
+    $wasm->register('data.fetch', fn (int $id) => fetchForTenant($tenantId, $id));
+    return $wasm->eval($source);
+}
+```

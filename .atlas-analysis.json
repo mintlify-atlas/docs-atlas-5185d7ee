@@ -1,0 +1,102 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Terrarium",
+  "projectDescription": "A PHP extension that runs untrusted JavaScript, TypeScript, Python, or PHP inside PHP — sandboxed in WebAssembly — against a typed capability SDK you define in plain PHP.",
+  "theme": "luma",
+  "primaryColor": "#2D6A4F",
+  "lightColor": "#52B788",
+  "darkColor": "#1B4332",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/capability-sdk",
+              "guides/guest-engines",
+              "guides/typescript-guest",
+              "guides/execution-modes",
+              "guides/deployment"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/security-model",
+              "concepts/type-inference"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Terrarium Class",
+            "pages": [
+              "api/overview",
+              "api/constructor",
+              "api/eval-check-analyze",
+              "api/register-capabilities",
+              "api/handles",
+              "api/types-output",
+              "api/errors"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "api/runtime-primitive",
+              "api/per-call-timeouts",
+              "api/precompile"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Language-agnostic guest execution — JavaScript (QuickJS-ng or Boa), TypeScript, Python (RustPython), or PHP all run from a single uniform API; swap the .wasm to change languages",
+    "In-process WebAssembly isolation boundary — a bug in the guest's own language engine cannot reach the PHP host, with no outer container or microVM required",
+    "Typed capability allowlist — you register plain PHP functions; the guest sees only those names, nothing else, via a flat dispatch table that is the entire trust boundary",
+    "TypeScript checked inside the sandbox — the real tsc runs in the guest and type-checks every eval against a .d.ts generated from your registered PHP SDK before execution",
+    "Automatic SDK type inference — PHP function signatures and PHPDoc (including nested array{} shapes) are reflected into .d.ts, .pyi, and .php stubs for guest authors",
+    "Bounded and optionally deterministic execution — memory, wall-clock (epoch), stack, and fuel limits; fuel gives reproducible runs",
+    "Synchronous-only mode — syncOnly: true makes the TypeScript guest reject async/await/generators and every use of a Promise at compile time",
+    "Type-argument schema extraction — analyze() derives JSON Schema from a TypeScript call's type argument and returns canonical, hashable bytes keyed by ordinal",
+    "Ahead-of-time precompilation — Terrarium::precompile() moves Cranelift compilation into the build pipeline for cold-start-free deployments (AWS Lambda/Bref ready)",
+    "Capability handles for live objects — grant()/resolve()/revoke() pass opaque integer handles to the guest for DB connections, file handles, and other stateful resources"
+  ],
+  "publicApiSurface": [
+    "new Terrarium(string $path, ?int $memoryLimit, ?int $timeoutMs, ?int $maxStack, ?int $fuel, bool $isolated, bool $syncOnly, ?array $typeArgumentSchemas, bool $precompiled)",
+    "Terrarium::precompile(string $path, ?int $maxStack, ?int $fuel, bool $portable): string",
+    "Terrarium::register(string $name, callable $fn): void",
+    "Terrarium::eval(string $source, ?int $timeoutMs): mixed",
+    "Terrarium::check(string $source, ?int $timeoutMs): array",
+    "Terrarium::analyze(string $source, ?int $timeoutMs): array",
+    "Terrarium::output(): string",
+    "Terrarium::types(string $format = 'dts'): string",
+    "Terrarium::grant(mixed $resource): int",
+    "Terrarium::resolve(int $handle): mixed",
+    "Terrarium::revoke(int $handle): bool",
+    "Terrarium::manifest(): array",
+    "Terrarium::reset(): bool",
+    "Terrarium\\Runtime (engine primitive — direct access, accepts bytes instead of paths, setCompileOptions/setTypes)",
+    "Terrarium\\Exception (base exception)",
+    "Terrarium\\GuestException (guest program error — type + message + line)",
+    "Terrarium\\TrapException (WASM trap: unreachable, OOB, bad indirect call)",
+    "Terrarium\\TimeoutException (wall-clock or fuel exhausted)",
+    "Terrarium\\MemoryException (linear-memory growth denied)"
+  ]
+}

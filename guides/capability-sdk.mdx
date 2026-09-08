@@ -1,0 +1,181 @@
+---
+title: "Defining a Typed Capability SDK in PHP"
+sidebarTitle: "Capability SDK"
+description: "Register PHP closures as a typed capability SDK that guest code can call. Learn naming rules, type inference from PHPDoc, and handle-based access for live objects."
+---
+
+`register()` is how you define the entire trust boundary. The guest can only call what you explicitly register — nothing else. There are no ambient APIs, no implicit globals, and no escape hatches: the flat dispatch table built from your `register()` calls is the only door between untrusted guest code and your host PHP process.
+
+## Registering capabilities
+
+```php
+register(string $name, callable $fn): void
+```
+
+Each capability is a PHP callable exposed under a dotted name. The guest reaches it **by that exact name**, with no synthetic root object wrapping it:
+
+```php
+use Terrarium\Terrarium;
+
+$wasm = new Terrarium('quickjs_guest.wasm');
+
+$wasm->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+// Guest calls it as:  user.fetch(42)
+// NOT as:             sdk.user.fetch(42)
+```
+
+A capability named `user.fetch` is called as `user.fetch(...)` in the guest — each segment of the dotted name becomes a nested property, installed as a frozen global on the guest's namespace. There is no root object.
+
+### Naming rules
+
+Every segment of the dotted name must be a valid identifier (letters, digits, `_`, not starting with a digit). Invalid names are rejected with an exception on `register()`.
+
+The following names are **reserved** by the bridge internals and are refused:
+
+- Names beginning with `$` (e.g. `$out`, `$error`, `$names`, `$dts`, `$opts`) — these are internal reserved capabilities used by the prelude.
+- Names beginning with `__host` — reserved for bridge machinery.
+
+<Warning>
+Registering a capability whose top-level segment shadows a guest built-in (`console`, `Math`, `print`, `Promise`, etc.) will produce a warning. Because there is no synthetic root, top-level capability names become guest globals — a capability named `console` replaces the guest's own `console` object. Choose names that do not collide with the guest language's standard globals.
+</Warning>
+
+## Type inference
+
+Types are inferred automatically from the PHP closure's signature and any PHPDoc annotations. You never write a separate schema.
+
+### Scalar types
+
+PHP's native type hints map directly to guest types:
+
+```php
+$wasm->register('math.add', fn (int $a, int $b): int => $a + $b);
+// TypeScript: (a: number, b: number) => number
+// Python:     (a: int, b: int) -> int
+
+$wasm->register('greet', fn (string $name): string => "Hello, $name");
+// TypeScript: (name: string) => string
+```
+
+The full scalar mapping (PHP → TypeScript):
+
+| PHP | TypeScript |
+|-----|------------|
+| `int` | `number` |
+| `float` | `number` |
+| `string` | `string` |
+| `bool` | `boolean` |
+| `void` | `void` |
+| `null` | `null` |
+| `object` | `Record<string, any>` |
+
+### Nullable and union types
+
+PHP nullable types (`?string`) and union types (`int|string`) are inferred from the signature directly:
+
+```php
+$wasm->register('maybe.len', fn (?string $s): ?int => $s === null ? null : strlen($s));
+// TypeScript: (s: string | null) => number | null
+```
+
+### PHPDoc for complex shapes
+
+PHP's type system cannot express rich object shapes. Use `@param` and `@return` PHPDoc annotations to fill the gap — Terrarium parses them with a recursive-descent parser, including nested `array{…}` shapes, optional keys, and element types:
+
+```php
+$wasm->register('user.fetch',
+    /**
+     * Fetch a user record by ID, including roles and metadata.
+     * @return array{name: string, roles: string[], meta: array{active: bool, score?: float}}
+     */
+    fn (int $id): array => [
+        'name'  => "user-$id",
+        'roles' => ['admin'],
+        'meta'  => ['active' => true],
+    ]);
+
+$wasm->register('user.search',
+    /**
+     * Search users by a free-text query, newest first.
+     * @param array{q: string, limit?: int} $query
+     * @return array{id: int, name: string}[]
+     */
+    fn (array $query): array => [['id' => 1, 'name' => 'Ada']]);
+```
+
+The leading prose of the docblock (everything before the first `@` tag) becomes a JSDoc comment in `.d.ts`, a `#` comment in `.pyi`, and a docblock line in the PHP stub — guest authors see what each capability does, not just its signature.
+
+<Note>
+Types are re-emitted as a `.d.ts` to the TypeScript guest on every `register()` call. The TypeScript guest fetches the current SDK definition before checking each eval, so the type environment always reflects the latest registrations.
+</Note>
+
+## Viewing the SDK definition
+
+Once capabilities are registered, call `types()` to retrieve the generated type declaration for whatever guest language you are targeting:
+
+```php
+// TypeScript .d.ts — what the TypeScript guest type-checks against
+echo $wasm->types('dts');
+
+// Python .pyi stub — TypedDicts for each object shape
+echo $wasm->types('pyi');
+
+// PHP stub — the SDK as guest PHP sees it (proxy classes + docblocks)
+echo $wasm->types('php');
+```
+
+An unknown format raises `InvalidArgumentException`.
+
+**Example output** for the `user.fetch` registration above:
+
+```typescript
+/** Fetch a user record by ID, including roles and metadata. */
+declare const user: {
+  readonly fetch: (id: number) => { name: string; roles: string[]; meta: { active: boolean; score?: number } };
+};
+```
+
+## Auditing capabilities
+
+`manifest()` returns the sorted list of every registered capability name. Use it as an audit surface — to confirm what the guest can reach before or after wiring a session:
+
+```php
+$wasm->register('math.add', fn (int $a, int $b): int => $a + $b);
+$wasm->register('user.fetch', fn (int $id): array => ['name' => 'Ada']);
+$wasm->register('log.info', fn (string $m): void => error_log($m));
+
+print_r($wasm->manifest());
+// ['log.info', 'math.add', 'user.fetch']  — sorted
+```
+
+## Capability handles for live objects
+
+Some host resources — database connections, file handles, open cursors — cannot be serialised and passed to the guest as data. For these, Terrarium provides an opaque handle mechanism:
+
+- **`grant(mixed $resource): int`** — stores the object host-side and returns an opaque integer handle.
+- **`resolve(int $handle): mixed`** — looks up and returns the live object from the handle table. Call this inside a registered capability.
+- **`revoke(int $handle): bool`** — drops the handle, returning `true` if it existed.
+
+The object never crosses the WASM boundary. The guest only ever sees an opaque integer it can pass back to a capability. The handle **is** the capability — the guest cannot do anything else with the integer.
+
+```php
+$pdo = new PDO('sqlite:app.db');
+$h   = $wasm->grant($pdo);
+
+$wasm->register('db.query', function (int $handle, string $sql) use ($wasm): array {
+    return $wasm->resolve($handle)->query($sql)->fetchAll();
+});
+
+// Guest code:
+//   db.query(0, "SELECT * FROM users")
+//
+// The integer 0 is the handle; the PDO object stays host-side.
+```
+
+Granted objects are refcount-bumped so they survive PHP garbage collection while held. Call `revoke()` at the end of a session to release them:
+
+```php
+$wasm->revoke($h);
+```

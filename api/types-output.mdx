@@ -1,0 +1,188 @@
+---
+title: "types(), output(), manifest(), and reset()"
+sidebarTitle: "types / output / manifest / reset"
+description: "Generate typed SDK declarations for guest authors, capture printed output, audit registered capabilities, and reset the shared instance with Terrarium's utility methods."
+---
+
+Four utility methods round out the Terrarium API: `types()` generates type declarations for guest authors, `output()` captures what the guest printed, `manifest()` lists the registered capabilities, and `reset()` drops the persistent shared Wasm instance.
+
+---
+
+## types()
+
+```php
+types(string $format = 'dts'): string
+```
+
+Generates a type declaration for the registered SDK, inferred from the registered closures' PHP signatures and PHPDoc (including nested `array{…}` shapes). The result is intended for guest authors who want type-checking or IDE support while writing guest code.
+
+Three formats are supported:
+
+| Format | Description | Used by |
+|---|---|---|
+| `'dts'` | TypeScript `.d.ts` declaration file | TypeScript guest (pushed automatically on each `register()`); TypeScript authors |
+| `'pyi'` | Python stub with `TypedDict`s | Python authors |
+| `'php'` | PHP stub with namespace classes | PHP guest authors |
+
+An unknown format string throws `\InvalidArgumentException`.
+
+<Note>
+  The TypeScript guest automatically receives an updated `.d.ts` every time you call `register()` — you do not need to call `types('dts')` yourself for the guest to type-check against the current SDK. `types()` is for surfacing the declaration to your guest authors or for debugging the inferred types.
+</Note>
+
+### Example: SDK declaration for a simple capability set
+
+Given these registrations:
+
+```php
+$t->register('math.add', fn (int $a, int $b): int => $a + $b);
+$t->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin']]);
+```
+
+The three formats produce:
+
+```typescript
+// types('dts')
+declare namespace math {
+    function add(a: number, b: number): number;
+}
+declare namespace user {
+    function fetch(id: number): { name: string; roles: string[] };
+}
+```
+
+```python
+# types('pyi')
+from typing import TypedDict
+from typing import List
+
+class UserFetchResult(TypedDict):
+    name: str
+    roles: List[str]
+
+def math_add(a: int, b: int) -> int: ...
+def user_fetch(id: int) -> UserFetchResult: ...
+```
+
+```php
+// types('php')
+namespace math {
+    function add(int $a, int $b): int {}
+}
+namespace user {
+    function fetch(int $id): array {}
+}
+```
+
+---
+
+## output()
+
+```php
+output(): string
+```
+
+Returns what the most recent `eval()` printed, with lines joined by `\n`. Captured output sources by guest:
+
+| Guest | Output source |
+|---|---|
+| JavaScript / TypeScript | `console.log(...)` |
+| Python | `print(...)` |
+| PHP | `echo` / `print` |
+
+**Key behaviours:**
+
+- The buffer is **cleared at the start of each `eval()`** — not at the start of `check()` or `analyze()`, which never touch it.
+- The buffer is **preserved even when `eval()` throws** — output printed before a crash, a type error, or an `AsyncIncomplete` is still readable.
+- `check()` and `analyze()` do **not** clear previous output.
+
+```php
+$t->eval('console.log("hello"); console.log("world");');
+echo $t->output();  // "hello\nworld"
+```
+
+Output printed before a throw is still accessible:
+
+```php
+use Terrarium\GuestException;
+
+try {
+    $t->eval('console.log("step 1"); throw new Error("boom");');
+} catch (GuestException $e) {
+    echo $e->getMessage();  // "Error: boom (line 1)"
+    echo $t->output();      // "step 1"  — printed before the throw
+}
+```
+
+This means a run→inspect→fix loop always has both the partial output **and** the typed exception available from the same failed call, without needing to re-run the source.
+
+---
+
+## manifest()
+
+```php
+manifest(): array
+```
+
+Returns a sorted array of all registered capability names — the audit surface for what the guest can reach.
+
+```php
+$t->register('math.add', fn (int $a, int $b): int => $a + $b);
+$t->register('user.fetch', fn (int $id): array => [/* … */]);
+$t->register('log.info', fn (string $m): void => error_log($m));
+
+print_r($t->manifest());
+// Array
+// (
+//     [0] => log.info
+//     [1] => math.add
+//     [2] => user.fetch
+// )
+```
+
+`manifest()` returns names in sorted order regardless of registration order.
+
+---
+
+## reset()
+
+```php
+reset(): bool
+```
+
+Drops the persistent shared Wasm instance, so the next `eval()` will re-instantiate the guest (including re-warming any engine-internal state, such as the TypeScript compiler context). Returns `true` if an instance existed and was dropped, `false` if there was nothing to drop.
+
+**What reset retains:**
+
+| Retained | Not retained |
+|---|---|
+| Compiled Engine and InstancePre | The Wasm instance and its state |
+| Registered callbacks and their captured PHP context | — |
+| Type declarations | — |
+| Compile options (`syncOnly`, `typeArgumentSchemas`) | — |
+| Captured output from the last eval | — |
+| Granted handles | — |
+
+Reset is a **no-op in isolated mode** (`isolated: true`): every `eval()` already uses a fresh instance, so there is no persistent instance to drop.
+
+### Use cases
+
+**Re-warming after SDK changes.** If you register new capabilities after an initial `eval()`, calling `reset()` forces the next eval to start a fresh TypeScript compiler context that sees the updated `.d.ts`. Without `reset()`, the persistent shared instance continues from its previous state.
+
+**Lightweight session cleanup.** After a user's session ends, `reset()` drops the guest instance without rebuilding the entire `Terrarium` object. The next user starts with a clean instance at the cost of one re-instantiation, while the Engine and InstancePre (the expensive compiled parts) are already in the process-wide cache.
+
+```php
+// After a user session ends:
+$t->reset();  // drops the Wasm instance, retains compiled engine
+
+// For a new session, register new capabilities and eval — the instance
+// is created fresh on the first eval:
+$t->register('ctx.user', fn () => $newSessionUser);
+$result = $t->eval($userCode);
+```
+
+<Warning>
+  Never call `reset()` from inside a callback registered on the same shared Runtime. The instance is live while a callback is executing; resetting it from within that callback is undefined behaviour. If you need to tear down a session from inside a capability, schedule the reset for after the eval returns.
+</Warning>

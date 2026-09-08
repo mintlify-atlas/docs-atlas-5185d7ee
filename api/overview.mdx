@@ -1,0 +1,71 @@
+---
+title: "Terrarium PHP API Overview"
+sidebarTitle: "Overview"
+description: "The Terrarium class exposes a single uniform API for all guest languages. Browse the full method reference for eval, check, register, types, handles, and errors."
+---
+
+`Terrarium\Terrarium` is the single public class you interact with — a thin, typed facade over the Rust-backed `Terrarium\Runtime` engine primitive. All classes live under the `Terrarium\` namespace. The guest's language is decided entirely by which `*_guest.wasm` file you load; every method below is identical across JavaScript, TypeScript, Python, and PHP guests.
+
+## Installation
+
+Install via Composer (automatically declares the `ext-terrarium` requirement):
+
+```sh
+composer require eddmann/terrarium
+```
+
+Or require the library directly:
+
+```php
+require 'lib/Terrarium.php';
+```
+
+Then import the class you need:
+
+```php
+use Terrarium\Terrarium;
+
+// or use fully-qualified names:
+$t = new \Terrarium\Terrarium('quickjs_guest.wasm');
+```
+
+## API pages
+
+<CardGroup cols={2}>
+  <Card title="Constructor" icon="hammer" href="/api/constructor">
+    Load a guest `.wasm` file and configure memory, timeout, stack, fuel, isolation, syncOnly, and precompiled options.
+  </Card>
+  <Card title="eval / check / analyze" icon="play" href="/api/eval-check-analyze">
+    Run guest source with `eval()`, validate it statically with `check()`, or extract JSON Schemas alongside diagnostics with `analyze()`.
+  </Card>
+  <Card title="register()" icon="plug" href="/api/register-capabilities">
+    Expose PHP callables as guest capabilities. The registered allowlist is the entire trust boundary.
+  </Card>
+  <Card title="Handles" icon="key" href="/api/handles">
+    Pass live PHP objects (DB connections, file handles) to guests as opaque integer handles via `grant()`, `resolve()`, and `revoke()`.
+  </Card>
+  <Card title="types / output / manifest / reset" icon="wrench" href="/api/types-output">
+    Generate typed SDK declarations, capture printed output, audit registered capabilities, and reset the shared instance.
+  </Card>
+  <Card title="Errors & exceptions" icon="triangle-exclamation" href="/api/errors">
+    A typed PHP exception hierarchy surfaces sandbox faults and guest-program errors with source line information.
+  </Card>
+</CardGroup>
+
+## Method summary
+
+| Method | Signature | Description |
+|---|---|---|
+| `new Terrarium()` | `(string $path, ...)` | Load a guest wasm, set limits |
+| `precompile()` | `static (string $path, ...): string` | AOT compile, return artifact bytes |
+| `register()` | `(string $name, callable $fn): void` | Register a PHP callable as a capability |
+| `eval()` | `(string $source, ?int $timeoutMs): mixed` | Run guest source, return result |
+| `check()` | `(string $source, ?int $timeoutMs): array` | Validate without running |
+| `analyze()` | `(string $source, ?int $timeoutMs): array` | `check()` + schema extraction |
+| `output()` | `(): string` | Captured guest output from last eval |
+| `types()` | `(string $format = 'dts'): string` | Generated SDK type declaration |
+| `grant()` | `(mixed $resource): int` | Grant live object, get opaque handle |
+| `resolve()` | `(int $handle): mixed` | Resolve handle to live object |
+| `revoke()` | `(int $handle): bool` | Drop a granted handle |
+| `manifest()` | `(): array` | Sorted registered capability names |
+| `reset()` | `(): bool` | Drop persistent shared instance |

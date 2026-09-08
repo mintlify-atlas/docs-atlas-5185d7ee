@@ -1,0 +1,144 @@
+---
+title: "Terrarium Security Model and Trust Boundaries"
+sidebarTitle: "Security Model"
+description: "How Terrarium's three-layer defense works: WebAssembly memory isolation, the capability allowlist, and resource limits — and what sits in the trust base."
+---
+
+Terrarium's security model is three independent layers, each defending against a different failure mode:
+
+1. **WebAssembly linear memory boundary** — the guest language engine itself runs inside the sandbox. A memory-corruption bug in that engine cannot reach the host process because the engine cannot form a pointer outside its own linear memory.
+2. **Capability allowlist** — the guest reaches exactly the PHP functions you registered under their dotted names, and nothing else. The allowlist is the entire trust boundary; there is no implicit ambient access.
+3. **Resource limits** — infinite loops, allocation bombs, and stack overflows are all bounded by VM-enforced limits before they can affect the host.
+
+These three layers are independent. A flaw in one does not collapse the others.
+
+---
+
+## Why WebAssembly for in-process isolation
+
+The classic way to run guest code from a host language is to embed the guest's engine natively — a C interpreter linked into the process. A capability model then contains _what the guest can reach_, and resource limits contain _abuse_ — but a memory-corruption bug in the embedded engine itself is **not** contained: it is native code in your process, and an engine bug becomes host RCE. The usual mitigation is an outer sandbox (gVisor, a microVM, a container) around the whole process — heavy machinery that reintroduces exactly the operational burden an in-process sandbox was supposed to avoid.
+
+A WASM runtime closes that gap **in-process**. The guest engine runs in a linear-memory sandbox: it cannot form a pointer outside its own memory, cannot call a syscall you didn't import, cannot reach the host heap. A bug _inside_ the guest — even inside a C language runtime compiled to WASM — stays inside the sandbox. The capability story sits on top; the memory-safety story is the VM's.
+
+The result: no containers, no microVMs, no `seccomp` policies. One PHP extension.
+
+---
+
+## The capability allowlist
+
+The trust boundary is a flat `HashMap<String, Zval>` (the dispatch table) populated entirely by `register()`. The guest reaches exactly what you registered — nothing else.
+
+```php
+$wasm->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+$wasm->register('db.query',
+    fn (int $handle, string $sql) => $wasm->resolve($handle)->query($sql)->fetchAll());
+```
+
+Every host call from the guest funnels through the single `host_call` import. The first thing the host does is look the dotted name up in the dispatch table — if it is not there, the call is rejected before any PHP code runs. There is **no synthetic root** and no implicit surface: a capability named `user.fetch` is reached as `user.fetch(...)` in the guest, and the prelude installs only the top-level segments of registered names as guest globals.
+
+The registered names are also the audit surface: `$wasm->manifest()` returns them sorted.
+
+---
+
+## Resource limits
+
+<Info>
+All limits are enforced by Wasmtime, not by PHP code. They cannot be bypassed from inside the guest.
+</Info>
+
+| Limit | Mechanism | Exception raised |
+|---|---|---|
+| Memory | `StoreLimits` — `memory.grow` fails when the cap is reached; VM-enforced, not advisory | `Terrarium\MemoryException` |
+| Wall-clock time | Epoch interruption (`timeoutMs`) — cheap, deadline-based | `Terrarium\TimeoutException` |
+| Deterministic CPU | Fuel metering — instruction-counted, reproducible | `Terrarium\TimeoutException` |
+| Stack depth | `Config::max_wasm_stack` | `Terrarium\TrapException` |
+| Ambient authority | None unless imported — zero WASI by default | n/a |
+
+Set limits at construction time:
+
+```php
+$wasm = new Terrarium(
+    'quickjs_guest.wasm',
+    memoryLimit: 32 << 20,   // 32 MB linear memory cap
+    timeoutMs:   500,        // 500 ms wall-clock per eval
+    maxStack:    512 << 10,  // 512 KB wasm stack
+);
+```
+
+Per-call overrides are also supported — useful when you want to allocate remaining budget dynamically:
+
+```php
+$rt = new Terrarium\Runtime($wasmBytes, isolated: false);
+$diagnostics = $rt->check($source, timeoutMs: 5000);
+if ($diagnostics === []) {
+    $result = $rt->eval($source, timeoutMs: 3000);
+}
+```
+
+---
+
+## No ambient authority
+
+A bare WASM instance with only the `host_call` import literally cannot do anything but compute and call back. It has no syscalls, no filesystem access, no network, no clock, no randomness — nothing. WASI (clocks, random, preopened directories) is opt-in per instance.
+
+This is a **stronger default than any natively-embedded engine**, where the guest typically starts with the engine's full standard library. A QuickJS or RustPython guest that doesn't need file I/O simply doesn't get it — and there is no way for it to acquire that authority on its own.
+
+The bundled libc-based guests (QuickJS, php-src) use WASI Preview 1 for their clock and random sources only. The WASI context is built sealed: no filesystem preopen, no network, no environment variables, no stdio. The guest gets exactly what the libc runtime needs and nothing more.
+
+---
+
+## Trust base
+
+<Note>
+Being honest about the trust base is part of the security model.
+</Note>
+
+**Wasmtime itself** is in the trust base. A bug in Wasmtime — not in the guest engine inside it, but in the WASM runtime itself — would not be contained. This is an honest residual. Wasmtime is a small, Rust, memory-safe, heavily-fuzzed surface — a far better bet than trusting each bundled language engine's C codebase — but it is not zero.
+
+Two host-side inputs extend that trust base with native code:
+
+<Warning>
+**Precompiled artifacts are native machine code.** `Terrarium::precompile()` produces a Cranelift-compiled native artifact. `Module::deserialize` only checks the artifact's framing — its contents are executed with the host's full authority, **outside the WASM sandbox**. Treat an artifact exactly as you treat `libterrarium.so`: produce it in your own build pipeline, ship it alongside the extension binary, and **never** load one that came from user input, an upload, or any source that crossed a trust boundary. Loading is opt-in (`precompiled: true`) and is never inferred from the bytes.
+</Warning>
+
+<Note>
+Wasmtime's **on-disk module cache** (`$XDG_CACHE_HOME/wasmtime`, enabled on every engine instance) stores and reloads Cranelift's native output. Whoever can write to that directory can supply native code with the same authority as a precompiled artifact. Treat the cache directory as part of the trust base, with the same permissions as the extension binary itself. A deployment that ships precompiled artifacts and does not use the on-disk cache does not need to worry about this.
+</Note>
+
+---
+
+## Deterministic execution
+
+Terrarium supports fully deterministic, reproducible guest runs. The recipe:
+
+1. Use **fuel** instead of (or in addition to) `timeoutMs` — fuel counts instructions deterministically rather than measuring wall-clock time.
+2. **Deny nondeterministic WASI imports** — the bundled guests only use clock and random from WASI Preview 1, and a capability-only guest imports none of it.
+3. Give the same source the same fuel budget on the same extension build → byte-identical results.
+
+This is useful for auditable runs, replay debugging, and environments that must reproduce guest behavior exactly.
+
+```php
+$wasm = new Terrarium('quickjs_guest.wasm', fuel: 10_000_000);
+// No wall-clock dependency; same source + same fuel = same result.
+$result = $wasm->eval('math.add(2, 3)');
+```
+
+<CardGroup cols={2}>
+  <Card
+    icon="layer-group"
+    title="Architecture"
+    href="/concepts/architecture"
+  >
+    The three-layer PHP-Rust-Wasm stack: the host ABI, value marshaling, and the dispatch table in detail.
+  </Card>
+  <Card
+    icon="magnifying-glass"
+    title="Type Inference"
+    href="/concepts/type-inference"
+  >
+    How PHP signatures and PHPDoc become typed `.d.ts`, `.pyi`, and `.php` stubs for guest authors.
+  </Card>
+</CardGroup>

@@ -1,0 +1,142 @@
+---
+title: "Terrarium Architecture: How WebAssembly Sandboxing Works"
+sidebarTitle: "Architecture"
+description: "Understand how Terrarium's PHP-Rust-Wasm stack works: the host ABI, value marshaling, the capability dispatch table, and how the guest isolation boundary is enforced."
+---
+
+Terrarium is built on three cooperating layers. **PHP** (trusted, full Zend engine) is where you define the SDK — registering closures, granting live objects, and calling `eval()`. **Rust** (the extension itself, built with `ext-php-rs` and embedding Wasmtime) owns the engine lifecycle, drives the `host_call` dispatch table, and marshals values across the boundary. The **WebAssembly guest** (untrusted) is a real language engine — QuickJS, RustPython, php-src, or any other WASM target — running in an isolated linear memory with no authority beyond what you registered.
+
+```text
+┌─ PHP (trusted, full Zend) ─┐   ┌─ Rust extension ──────┐   ┌─ WASM guest (untrusted) ─┐
+│ $w->register('db.query',…) │   │  owns Wasmtime Engine  │   │  linear memory (sandbox)  │
+│ $w->grant($pdo)            │◄─►│  Store + Instance      │◄─►│  exports: alloc, eval     │
+│ $w->eval($source)          │   │  host_call dispatch    │   │  imports: host_call, …    │
+└────────────────────────────┘   └────────────────────────┘   └───────────────────────────┘
+        ext-php-rs (zval ↔ Rust)      wasmtime (Rust ↔ wasm)        SDK-globals prelude (per engine)
+```
+
+The single design principle: **the namespacing is cosmetic; the trust boundary is a flat dispatch table reached through one host import.** Everything a guest can ever do funnels through that one door.
+
+---
+
+## The host ABI
+
+The extension provides every guest with a single import:
+
+```wasm
+host_call(name_ptr: i32, name_len: i32, args_ptr: i32, args_len: i32) -> i64
+```
+
+The protocol is byte-oriented by design — WASM linear memory is naturally a byte array, so bytes are the honest common denominator across every guest language:
+
+1. The guest msgpack-encodes its argument array into its own linear memory and passes `(name_ptr, name_len)` for the dotted capability name and `(args_ptr, args_len)` for the encoded args.
+2. The host reads those bytes out of the guest `Memory` and decodes them into a `Vec<MiddleValue>`.
+3. The dotted name is looked up in the **dispatch table** — a `HashMap<String, Zval>` populated by `register()`. If the name is not registered, the call is rejected immediately. This lookup is the trust boundary.
+4. `MiddleValue` values are converted to PHP `zval`s and the registered PHP callable is invoked via `ZendCallable`.
+5. The result is encoded back to msgpack. To return bytes _into_ the guest, the host calls the guest-exported allocator and writes there. The packed `i64` return value carries `(ret_ptr << 32) | ret_len` — the same shape as the canonical `cabi_realloc` trick used in the component model.
+
+A small **prelude** baked into each engine guest hides the ABI from guest authors. At startup it queries the host for the registered top-level names (the reserved `$names` capability) and installs each as a global — a recursive proxy where `<dotted.name>(...)` internally encodes args, calls `host_call`, and decodes the result. There is **no synthetic root**: a capability registered as `user.fetch` is reached directly as `user.fetch(...)` in JavaScript or Python, or `$user->fetch(...)` in a PHP guest.
+
+---
+
+## Guest contract
+
+Every WASM guest must export exactly three symbols:
+
+| Export | Signature | Purpose |
+|---|---|---|
+| `memory` | (the linear memory) | The guest's address space — the host reads and writes values here |
+| `guest_alloc` | `(len: i32) -> i32` | Allocate `len` bytes; the host writes host→guest payloads to the returned pointer |
+| `eval` | `(ptr: i32, len: i32) -> i64` | Run source msgpack at `(ptr, len)`; return the result as a packed `(ret_ptr << 32) \| ret_len` |
+
+Two **optional** exports extend the contract. Both have the same byte ABI as `eval` and share the same guarantee — nothing executes, no capability can fire, and the output buffer is untouched:
+
+- **`check(ptr, len) -> i64`** — statically validate the source and return a msgpack array of diagnostics (`{message, type?, line?}`; an empty array means it passed). Surfaced as `Terrarium::check()`. Every bundled guest implements it: the TypeScript guest runs a full type-check against the registered SDK; the JS, Python, and PHP guests report syntax and compile errors.
+- **`analyze(ptr, len) -> i64`** — the same analysis with a wider result: a msgpack map `{diagnostics, schemas}`. Surfaced as `Terrarium::analyze()`. Currently only the TypeScript guest implements it; `schemas` carries the JSON Schema derived from the type argument of each call named by the `type_argument_schemas` compile option.
+
+The two-entrypoint design is intentional: the `check()` diagnostics array is the older, frozen contract, so anything richer joins `analyze()`'s open map without requiring version sniffing or ABI changes.
+
+---
+
+## Value marshaling
+
+A neutral middle representation, `MiddleValue`, decouples the guest's value model from PHP's `zval`:
+
+```text
+guest value  ──►  MiddleValue  ──►  PHP zval
+                      │
+                msgpack bytes   (carried over linear memory)
+```
+
+`MiddleValue` covers eight variants — `Null`, `Bool`, `Int`, `Float`, `Str`, `Bytes`, `Array`, and `Map` — serialized to and from **native** msgpack types (not serde's tagged-enum form). A guest-side msgpack codec interoperates with it byte-for-byte, making the bridge language-agnostic.
+
+Buffer ownership rules are strict:
+
+- **Host → guest:** the host calls `guest_alloc(n)`, writes `n` bytes to the returned pointer, then hands the guest `(ptr, len)`. The guest owns and frees the allocation.
+- **Guest → host:** the guest writes into its own memory and passes `(ptr, len)`; the host _copies out_ immediately after the call returns and never retains a raw guest pointer across calls.
+
+Memory is **enforced by the VM**, not advisory. `StoreLimits` caps how large the linear memory may grow, so an allocation bomb in the guest fails at `memory.grow` rather than OOM-ing the host.
+
+<Note>
+WASM has a true `i64` type, but JavaScript engines represent all numbers as IEEE 754 doubles. Integers beyond 2^53 lose precision inside a JS guest — a property of the guest language, not the bridge itself. Non-JS guests (Python, PHP, Rust) are unaffected.
+</Note>
+
+---
+
+## Why Wasmtime
+
+Wasmtime is the natural fit for a PHP extension with first-class resource limits:
+
+- **Same stack.** Wasmtime is a Rust crate that embeds cleanly into the `ext-php-rs` `cdylib` — no new language, no FFI gymnastics.
+- **First-class resource limits.** `StoreLimits`/`ResourceLimiter` (memory and table caps), **fuel** (deterministic instruction metering), **epoch interruption** (cheap wall-clock deadlines), and `Config::max_wasm_stack` map one-to-one onto the `memoryLimit`, `timeoutMs`, `fuel`, and `maxStack` constructor options.
+- **WASI Preview 1** (`wasmtime-wasi`) — lets libc-based guests (QuickJS, php-src) link a working clock and random source. Capability-only guests import none of it.
+- **Fast instantiation.** Compile a `Module` once, then use `InstancePre` to instantiate cheaply per call. Cache AOT artifacts with `Module::serialize`/`deserialize`. This is what makes isolated mode practical.
+- **No JIT required.** The Pulley interpreter and Winch baseline compiler exist for environments that forbid W^X memory (e.g. some serverless configurations), supporting AWS Lambda / Bref deployments.
+
+---
+
+## Reserved capabilities
+
+Several dotted names beginning with `$` are reserved by the bridge and intercepted before the dispatch table is consulted. They cannot collide with registered capabilities (which must use plain identifier segments):
+
+| Reserved name | Purpose |
+|---|---|
+| `$names` | Queried once at guest startup. Returns the unique top-level segments of every registered name (`["math", "user", ...]`); the prelude installs each as a guest global. |
+| `$out` | Output capture. `console.log`/`print`/`echo` in the prelude routes through this name. Intercepted host-side into a per-`eval` buffer before any dispatch-table lookup. |
+| `$error` | Not a capability, but a reserved result shape: `{"$error": {message, type?, line?}}`. When `eval()` returns this map, the host raises it as a `Terrarium\GuestException`. |
+| `$dts` | Serves the host-generated `.d.ts` of the registered SDK to type-aware guests (the TypeScript guest fetches it before each eval and type-checks the source against it). Updated by the PHP facade after every `register()` call. |
+| `$opts` | Serves the host's compile options as an open map. Guests that compile source (the TypeScript guest) consult this before accepting a program. Today's keys: `sync_only` (bool) and `type_argument_schemas` (list of callee names). Guests ignore keys they don't know. |
+
+---
+
+## Core concepts at a glance
+
+| Concern | Mechanism |
+|---|---|
+| Guest state & limits | Wasmtime `Engine` + `Store` |
+| Unit of isolation | Wasmtime `Instance` (its own linear `Memory`) |
+| Host access | one import: `host_call` |
+| Trust boundary | flat dispatch table (`HashMap`) populated by `register()` |
+| Value transport | `MiddleValue` ↔ msgpack bytes ↔ PHP `zval`, over linear memory |
+| Live host objects | host-side handle table → opaque `i64` |
+| Memory limit | `StoreLimits` |
+| CPU / time limit | epoch interruption (wall-clock) or fuel (deterministic) |
+| Stack limit | `Config::max_wasm_stack` |
+| Faults | typed `Terrarium\Exception` family |
+
+<CardGroup cols={2}>
+  <Card
+    icon="book"
+    title="Security Model"
+    href="/concepts/security-model"
+  >
+    How the three-layer defense works: the WebAssembly memory boundary, the capability allowlist, and resource limits.
+  </Card>
+  <Card
+    icon="code"
+    title="Type Inference"
+    href="/concepts/type-inference"
+  >
+    How Terrarium reflects PHP signatures and PHPDoc to emit `.d.ts`, `.pyi`, and `.php` stubs.
+  </Card>
+</CardGroup>

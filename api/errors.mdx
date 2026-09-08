@@ -1,0 +1,164 @@
+---
+title: "Terrarium Exception Hierarchy and Error Handling"
+sidebarTitle: "Errors"
+description: "Terrarium surfaces guest failures as a typed PHP exception hierarchy. Learn the difference between sandbox-level faults and guest-program errors, and how output survives a throw."
+---
+
+A Terrarium run produces three independent things: the **result** (the return value of `eval()`), the **output** (`output()`), and — on failure — a typed **exception**. Failures come from two cleanly separated layers: sandbox-level faults (the engine aborting) and guest-program errors (the guest's own language-level error, caught and forwarded).
+
+## Exception hierarchy
+
+```
+\Exception
+  └─ Terrarium\Exception              (base for everything the extension throws)
+       ├─ Terrarium\TrapException     (the guest trapped: unreachable, OOB, bad indirect call)
+       ├─ Terrarium\TimeoutException  (the wall-clock deadline or fuel budget tripped)
+       ├─ Terrarium\MemoryException   (a linear-memory bound was hit)
+       └─ Terrarium\GuestException    (the guest program itself raised an error)
+```
+
+All four extend `Terrarium\Exception`, so a single catch covers every failure — or catch a leaf class to be specific:
+
+```php
+use Terrarium\Terrarium;
+use Terrarium\GuestException;
+use Terrarium\TimeoutException;
+use Terrarium\Exception as TerrariumException;
+
+try {
+    $result = $t->eval($source);
+} catch (TimeoutException $e) {
+    // Infinite loop, or the wall-clock / fuel budget was exhausted.
+} catch (GuestException $e) {
+    // The guest program raised (a JS throw, a Python traceback,
+    // a failed TypeScript type-check, an AsyncIncomplete).
+    echo $e->getMessage();  // "TypeError: cannot read property … (line 2)"
+    echo $t->output();      // output printed before the error
+} catch (TerrariumException $e) {
+    // TrapException, MemoryException, or any other sandbox fault.
+}
+```
+
+---
+
+## Sandbox-level faults
+
+`TrapException`, `TimeoutException`, and `MemoryException` are the engine aborting the call. They are not guest-program errors; they come from the interrupt handler or the allocator and **carry no source location**.
+
+When a sandbox-level fault occurs, the Wasm instance is **poisoned and dropped**. The `Terrarium` object remains usable: the next `eval()` re-instantiates the guest and continues normally. This automatic recovery means a single misbehaving eval does not permanently break the sandbox.
+
+| Exception | Cause |
+|---|---|
+| `Terrarium\TrapException` | A Wasm trap: `unreachable`, out-of-bounds memory access, bad indirect call, stack overflow (if `maxStack` is set), or division by zero |
+| `Terrarium\TimeoutException` | The wall-clock deadline (`timeoutMs`) expired, **or** the fuel budget was exhausted |
+| `Terrarium\MemoryException` | A `memory.grow` instruction would exceed the `memoryLimit` set at construction |
+
+---
+
+## Guest-program errors (GuestException)
+
+`GuestException` is not a trap: the guest catches its own language-level error (a JS `throw`, a Python traceback, a failed TypeScript type-check) and returns a sentinel value `{"$error": {message, type?, line?}}` that the host recognises and raises as `GuestException`.
+
+The message reads `Type: message (line N)` — the error's type, its text, and the source line. Because the TypeScript guest erases types whitespace-preserving (see [Source lines stay exact](#source-lines-stay-exact)), that line points at the source you submitted, not at a transformed intermediate.
+
+**The Wasm instance is NOT poisoned by a `GuestException`** — the guest's runtime is still healthy; only the program raised an error. The sandbox is ready for the next `eval()` without re-instantiation.
+
+```php
+$ts->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin']]);
+
+try {
+    // Type-checks fine — roles[9] is typed `string`, only undefined at runtime.
+    $ts->eval("const u = user.fetch(42);\nu.roles[9].toUpperCase();");
+} catch (GuestException $e) {
+    echo $e->getMessage();
+    // "TypeError: cannot read property 'toUpperCase' of undefined (line 2)"
+}
+```
+
+---
+
+## Guest error types
+
+The `Type` prefix in `Type: message (line N)` is the guest's own error name where the language has one (`TypeError`, `SyntaxError`, a Python exception class name). Several types are Terrarium's own:
+
+| Type | Raised by | When |
+|---|---|---|
+| `TS<code>` | TypeScript guest | A type diagnostic — the TypeScript compiler's own code (`TS2345`, `TS2322`, …) |
+| `TSSyntaxError` | TypeScript guest | Syntax that cannot be type-erased (`enum`, `namespace`, …) |
+| `TSSyncOnly` | TypeScript guest with `syncOnly: true` | `async`, `await`, `for await`, `function*`, `yield`, and every use of a `Promise` — rejected at compile time |
+| `TSEngineUnsupported` | TypeScript guest, always | Syntax the sandbox engine cannot parse though the TypeScript checker accepts it (e.g. `accessor` class members) |
+| `TSSchemaError` | TypeScript guest with `typeArgumentSchemas` | A matched call's type argument has no JSON Schema form — a static diagnostic only, carrying the call ordinal and the offending member path |
+| `AsyncIncomplete` | QuickJS + TypeScript guests, always | The eval produced a `Promise`, left jobs queued, or registered a promise reaction — the sandbox has no event loop and cannot finish it |
+
+### AsyncIncomplete
+
+`AsyncIncomplete` is the loud version of a failure that used to be silent. The sandbox has no event loop: an async program would half-run and appear to return normally. Three independent checks run after every JS/TS eval:
+
+1. **The result is a `Promise`** — in any state, since `.then` callbacks are queued rather than called inline.
+2. **Jobs are queued** at the end of the eval — the pending reactions of a settled promise.
+3. **Any promise reaction was registered** during the eval — a `.then`, `.catch`, or `.finally` was registered, counted by an instrument the guest prelude installs before user code runs.
+
+Check 3 exists because checks 1 and 2 together miss: `const p = new Promise(() => {}); p.then(f); 42`. The result is `42` and no job is queued (a reaction on a never-settling promise never becomes a job). Without check 3, `f` is abandoned silently.
+
+```php
+try {
+    $js->eval('(async () => { console.log("step 1"); await 1; save(); })()');
+} catch (GuestException $e) {
+    echo $e->getMessage();
+    // "AsyncIncomplete: asynchronous guest code cannot complete: …"
+    echo $js->output();
+    // "step 1"  — save() never ran
+}
+```
+
+**The documented limitation:** `await` does not go through `Promise.prototype.then` — the engine uses an internal path — so a fire-and-forget async function suspended on a promise that never settles is invisible to all three checks. This is a documented limitation, not a guarantee. `syncOnly: true` on the TypeScript guest rejects such patterns at compile time.
+
+---
+
+## Static validation vs. runtime errors
+
+`check()` returns diagnostics as **data**, never as exceptions, and never executes the guest:
+
+```php
+$ts->check('user.fetch("42")');
+// [['message' => "Argument of type 'string' is not assignable to parameter of type 'number'.", 'type' => 'TS2345', 'line' => 1]]
+```
+
+<Note>
+  `TSSchemaError` diagnostics live only in `check()` / `analyze()` output. They are produced by type-argument extraction, which runs on the static path and never gates `eval()`. `check()` is for lint-style validation; `eval()` throws `GuestException` for errors that only appear at run time — and for TypeScript type errors that fire before any guest code executes.
+</Note>
+
+---
+
+## Source lines stay exact
+
+The TypeScript guest erases types with [ts-blank-space](https://github.com/bloomberg/ts-blank-space), which replaces type syntax with whitespace of the same byte width. The executed JavaScript is therefore **positionally identical** to the TypeScript you submitted, so a runtime error's `(line N)` matches your source exactly — no source-map indirection required.
+
+| Guest | Line in errors | Notes |
+|---|---|---|
+| QuickJS, RustPython, PHP | Yes | Parsed from the engine's own stack trace |
+| TypeScript | Yes | Exact — whitespace-preserving erasure |
+| Boa | Type + message only | Boa's public API exposes no reliable source span |
+
+---
+
+## Output survives a throw
+
+`output()` is a separate channel from the return value and the exception. The buffer is **cleared at the start of each `eval()`** and preserved through a throw — anything the guest printed before it crashed is still readable:
+
+```php
+use Terrarium\GuestException;
+
+try {
+    $t->eval('console.log("step 1"); throw new Error("boom");');
+} catch (GuestException $e) {
+    echo $e->getMessage();  // "Error: boom (line 1)"
+    echo $t->output();      // "step 1"  — printed before the throw
+}
+```
+
+`check()` and `analyze()` do **not** clear the output buffer. Only `eval()` clears it (at the start of the call, before running anything). This means partial output from a failed eval is still readable after a subsequent `check()` on the same `Terrarium` instance.
+
+This is exactly what a run→inspect→fix loop needs: the partial output **and** the typed error, both recoverable from the same failed call.

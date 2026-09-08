@@ -1,47 +1,192 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Terrarium in 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Create your first Terrarium sandbox: register PHP capabilities, run JavaScript guest code, and handle errors — in a single PHP file."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+In this guide you will build a sandboxed JavaScript environment that calls PHP capabilities you define. By the end you will have loaded a guest engine, registered a typed PHP function as a capability, run untrusted guest code that calls it, read captured output, handled guest exceptions, and inspected the generated type declaration — all in a single PHP file.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Load a guest engine">
+    Create a `Terrarium` instance by pointing it at a `*_guest.wasm` file. Set resource limits to contain untrusted code:
 
-    ```bash
-    npm install your-package
+    ```php
+    require 'vendor/autoload.php';
+
+    use Terrarium\Terrarium;
+
+    $wasm = new Terrarium(
+        'quickjs_guest.wasm',
+        timeoutMs: 500,
+        memoryLimit: 32 << 20,   // 32 MB
+    );
+    ```
+
+    The guest language is decided entirely by which `.wasm` you load. Swap `quickjs_guest.wasm` for `boa_guest.wasm`, `rustpython_guest.wasm`, `php_guest.wasm`, or `typescript_guest.wasm` and nothing else in the host code changes.
+  </Step>
+
+  <Step title="Register capabilities">
+    Expose PHP functions to the guest with `register()`. Use a dotted name; the guest calls it exactly as written — `user.fetch(...)` — with no synthetic root. Types are inferred from the PHP signature and PHPDoc, including nested `array{…}` shapes:
+
+    ```php
+    $wasm->register('user.fetch',
+        /**
+         * Fetch a user by ID.
+         * @return array{name: string, roles: string[]}
+         */
+        fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+    ```
+
+    The capability allowlist is the entire trust boundary. The guest can only call functions you explicitly passed to `register()`. It has no access to your filesystem, database, network, or any other PHP state.
+  </Step>
+
+  <Step title="Run guest code">
+    Call `eval()` with any guest-language source string. The result is marshalled back to a PHP value:
+
+    ```php
+    $result = $wasm->eval('user.fetch(42).roles.length');
+    echo $result;   // 2
+    ```
+
+    The guest engine runs entirely inside WebAssembly. Even a memory-corruption bug in the engine cannot reach your PHP process.
+  </Step>
+
+  <Step title="Inspect captured output">
+    Anything the guest writes via `console.log` (JavaScript/TypeScript) or `print` (Python) / `echo` (PHP) is captured into a per-`eval` buffer. Read it with `output()` after the call:
+
+    ```php
+    $wasm->eval('console.log("hello from the sandbox"); "done"');
+    echo $wasm->output();   // "hello from the sandbox"
+    ```
+
+    Output is preserved even when the `eval` throws an exception, so anything printed before a crash is still readable.
+  </Step>
+
+  <Step title="Handle errors">
+    Guest failures surface as typed exceptions in the `Terrarium\Exception` family. Catch the specific type you expect, or the base `Exception` for everything:
+
+    ```php
+    use Terrarium\GuestException;
+    use Terrarium\TimeoutException;
+    use Terrarium\MemoryException;
+    use Terrarium\Exception as TerrariumException;
+
+    try {
+        $wasm->eval('user.fetch("not-an-int")');
+    } catch (GuestException $e) {
+        // A guest-side error: a thrown JS exception, Python traceback,
+        // or TypeScript type error. Message format: "Type: message (line N)"
+        echo $e->getMessage();
+    } catch (TimeoutException $e) {
+        // Wall-clock budget (timeoutMs) or fuel limit exhausted.
+        echo 'Guest timed out: ', $e->getMessage();
+    } catch (MemoryException $e) {
+        // Guest exceeded the memoryLimit.
+        echo 'Guest ran out of memory: ', $e->getMessage();
+    } catch (TerrariumException $e) {
+        // Catch-all for any other Terrarium error.
+        echo 'Terrarium error: ', $e->getMessage();
+    }
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+  <Step title="Get the type declaration">
+    Call `types()` to emit the generated type declaration for your registered SDK, inferred directly from the PHP signatures and PHPDoc:
 
-    ```bash
-    your-cli start
+    ```php
+    // TypeScript .d.ts — what the TypeScript guest type-checks against
+    echo $wasm->types('dts');
+
+    // Python .pyi stub — TypedDicts derived from your PHP array shapes
+    echo $wasm->types('pyi');
+
+    // PHP stub — namespace classes; the PHP guest's view of the SDK
+    echo $wasm->types('php');
     ```
+
+    Share the appropriate stub with the author writing guest code so their editor provides autocompletion and inline type errors without you maintaining a separate schema.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+<Note>
+  `check()` validates guest source **without running it** and returns every diagnostic as structured data — `[]` means it passed. Nothing executes: no capability fires and `output()` is untouched. Use it to lint untrusted source before committing to a full `eval()`. See the [eval / check / analyze reference](/api/eval-check-analyze).
+</Note>
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+## Running multiple languages
+
+The four-language example below registers an identical SDK once and evaluates the same program in every bundled guest engine. Only the `.wasm` path changes:
+
+```php
+require __DIR__ . '/../lib/Terrarium.php';
+
+use Terrarium\Terrarium;
+
+$wasm = fn (string $f) => __DIR__ . "/../tests/wasm/$f";
+
+// Register the same SDK on any Terrarium instance.
+function wire(Terrarium $g): void
+{
+    $g->register('math.add', fn (int $a, int $b): int => $a + $b);
+    $g->register('user.fetch',
+        /** @return array{name: string, roles: string[]} */
+        fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+    $g->register('log.info', fn (string $m): void => print($m . PHP_EOL));
+}
+
+// JavaScript source
+$jsSrc = <<<'JS'
+    const u = user.fetch(42);
+    log.info(`fetched ${u.name}`);
+    `${u.name} / roles=${u.roles.length} / add=${math.add(2, 3)}`
+    JS;
+
+// Python source
+$pySrc = <<<'PY'
+    u = user.fetch(42)
+    log.info("fetched " + u["name"])
+    "%s / roles=%d / add=%d" % (u["name"], len(u["roles"]), math.add(2, 3))
+    PY;
+
+// PHP-in-PHP source (SDK exposed as proxy objects)
+$phpSrc = <<<'GUEST'
+    $u = $user->fetch(42);
+    $log->info("fetched " . $u["name"]);
+    return sprintf("%s / roles=%d / add=%d", $u["name"], count($u["roles"]), $math->add(2, 3));
+    GUEST;
+
+// Run the same program in all four engines — only the .wasm path differs.
+foreach ([
+    'QuickJS-ng (JavaScript)' => [$wasm('quickjs_guest.wasm'), $jsSrc, 2000],
+    'Boa (JavaScript)'        => [$wasm('boa_guest.wasm'), $jsSrc, 2000],
+    'RustPython (Python)'     => [$wasm('rustpython_guest.wasm'), $pySrc, 5000],
+    'php-src (PHP-in-PHP)'    => [$wasm('php_guest.wasm'), $phpSrc, 5000],
+] as $engine => [$path, $src, $budget]) {
+    echo "=== $engine ===\n";
+    $g = new Terrarium($path, timeoutMs: $budget);
+    wire($g);
+    echo $g->eval($src), "\n\n";
+}
+```
+
+<Tip>
+  For code you write yourself or want to validate rigorously, use the TypeScript guest. It runs the real `tsc` inside the sandbox and type-checks every `eval()` against the `.d.ts` generated from your PHP SDK before executing anything — a wrong argument type or missing property is caught before a single line of guest code runs. See [TypeScript guest](/guides/typescript-guest).
 </Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Capability SDK guide"
+    icon="puzzle-piece"
+    href="/guides/capability-sdk"
+  >
+    Learn how to register typed PHP capabilities, work with nested array shapes and PHPDoc, grant opaque handles for stateful resources, and audit the allowlist with `manifest()`.
+  </Card>
+  <Card
+    title="API overview"
+    icon="book-open"
+    href="/api/overview"
+  >
+    The full reference for every method on the `Terrarium` class: `eval()`, `check()`, `analyze()`, `types()`, `grant()`, `resolve()`, `revoke()`, `reset()`, and per-call timeouts.
+  </Card>
+</CardGroup>

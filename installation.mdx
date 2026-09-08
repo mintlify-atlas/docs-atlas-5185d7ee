@@ -1,0 +1,178 @@
+---
+title: "Install Terrarium: Extension, Library, and Guest Wasm"
+sidebarTitle: "Installation"
+description: "Install the Terrarium PHP extension binary, PHP library via Composer, and a guest engine Wasm for your platform — Linux, macOS, Docker, or AWS Lambda."
+---
+
+Terrarium has **three pieces**, and all three are required before you can run a single `eval()`:
+
+1. **The extension binary** — the Rust `cdylib` PHP loads (`libterrarium.so` / `.dylib`). It is tied to an exact OS, CPU architecture, PHP minor version, and thread-safety model.
+2. **The PHP library** (`lib/*.php`) — the public `Terrarium\Terrarium` facade and the type inference engine. Platform-independent; install via Composer or require directly.
+3. **A guest engine** (`*_guest.wasm`) — the language engine the extension runs inside WebAssembly. Platform-independent; pick the language(s) you need.
+
+Each [release on GitHub](https://github.com/eddmann/terrarium/releases) attaches all three.
+
+## Release artifacts
+
+The following artifacts are published per PHP version (8.4 / 8.5), all NTS builds:
+
+| Artifact | For |
+|---|---|
+| `terrarium-vX-php8.4-linux-x86_64.so` / `-aarch64.so` | Self-hosted Linux / Docker (glibc ≥ 2.35) |
+| `terrarium-vX-php8.4-lambda-bref-x86_64.zip` / `-arm64.zip` | AWS Lambda via [Bref](https://bref.sh) — a ready Lambda layer |
+| `terrarium-vX-php8.4-lambda-bref-*.so` | Lambda / Amazon Linux 2023 — the raw `.so` if you prefer it (glibc ≥ 2.34) |
+| `terrarium-vX-php8.4-lambda-bref-*-precompiled-guests.zip` | TypeScript guest precompiled for that exact Lambda `.so`, without fuel metering |
+| `terrarium-vX-php8.4-macos-arm64.dylib` | Local development on macOS (Apple Silicon) |
+| `terrarium-vX-php-lib.zip` | The PHP library (`lib/`) — required, platform-independent |
+| `terrarium-vX-guests.zip` | All guest engines (`*_guest.wasm`) — pick your language(s) |
+
+<Warning>
+  The Lambda build is made **inside the Bref Amazon Linux 2023 image**, so it links against glibc 2.34 and loads correctly on Lambda. A binary built on a standard Ubuntu host links against a newer glibc version and **will fail to load** on Lambda. Always use the `lambda-bref-*` artifact for Lambda deployments.
+</Warning>
+
+<Note>
+  All builds are **NTS (non-thread-safe)** — the same model used by CLI, FPM, and Bref. The design assumes a single thread. Do not load Terrarium under a ZTS SAPI.
+</Note>
+
+## Self-hosted (Linux / macOS / Docker)
+
+<Steps>
+  <Step title="Download the extension binary">
+    From the [releases page](https://github.com/eddmann/terrarium/releases), download the `.so` (Linux) or `.dylib` (macOS) matching your PHP version and CPU architecture. Also download `terrarium-vX-guests.zip` and extract the guest engine(s) you want.
+
+    ```sh
+    # Example for Linux x86_64
+    curl -LO https://github.com/eddmann/terrarium/releases/latest/download/terrarium-vX-php8.4-linux-x86_64.so
+    curl -LO https://github.com/eddmann/terrarium/releases/latest/download/terrarium-vX-guests.zip
+    unzip terrarium-vX-guests.zip
+    ```
+  </Step>
+
+  <Step title="Enable the extension in php.ini">
+    Find your active `php.ini` with `php --ini`, then add the `extension=` directive:
+
+    ```ini
+    ; php.ini
+    extension=/path/to/terrarium-vX-php8.4-linux-x86_64.so
+    ```
+  </Step>
+
+  <Step title="Verify the extension loaded">
+    ```sh
+    php -d extension=/path/to/terrarium-vX-php8.4-linux-x86_64.so \
+        -r 'var_dump(class_exists("Terrarium\\Runtime"));'
+    # bool(true)
+    ```
+  </Step>
+
+  <Step title="Install the PHP library via Composer">
+    The Composer package declares `ext-terrarium` as a requirement, so Composer will error clearly if the extension binary is not enabled.
+
+    ```sh
+    composer require eddmann/terrarium
+    ```
+
+    Alternatively, unzip `terrarium-vX-php-lib.zip` and require `lib/Terrarium.php` directly — no autoloader needed.
+  </Step>
+
+  <Step title="Load a guest engine in your script">
+    ```php
+    require 'vendor/autoload.php';
+
+    use Terrarium\Terrarium;
+
+    $t = new Terrarium('/path/to/quickjs_guest.wasm');
+    echo $t->eval('1 + 1');   // 2
+    ```
+  </Step>
+</Steps>
+
+### Docker
+
+Copy the `.so` into the image and drop an ini file into the `conf.d` directory scanned by PHP:
+
+```dockerfile
+COPY terrarium-vX-php8.4-linux-x86_64.so /usr/local/lib/php/terrarium.so
+RUN echo 'extension=/usr/local/lib/php/terrarium.so' \
+    > /usr/local/etc/php/conf.d/terrarium.ini
+```
+
+## AWS Lambda (Bref)
+
+The Bref release artifacts follow Bref's layout: the extension lives at `/opt/bref/extensions/` and ini files are scanned from `/opt/bref/etc/php/conf.d/`. The same `.so` and ini work whether you go via a Lambda layer or bake the binary directly into a Docker image. Match the **architecture** (`arm64` for Graviton, `x86_64` otherwise) and **PHP version** to your Bref runtime.
+
+<Steps>
+  <Step title="Choose your deployment approach">
+    Pick either the **Docker image** approach (bake the `.so` into a `FROM bref/php-XX:3` image) or the **Lambda layer** approach (publish the ready-made `.zip` as a layer and reference its ARN). Both are shown below.
+  </Step>
+
+  <Step title="Docker image approach">
+    Bake the Lambda-specific `.so` directly into your image:
+
+    ```dockerfile
+    FROM bref/php-84:3
+    COPY terrarium-vX-php8.4-lambda-bref-arm64.so /opt/bref/extensions/terrarium.so
+    RUN echo 'extension=terrarium.so' \
+        > /opt/bref/etc/php/conf.d/ext-terrarium.ini
+    COPY . /var/task
+    ```
+  </Step>
+
+  <Step title="Lambda layer approach">
+    The `lambda-bref-*.zip` artifact is a ready layer — it already contains `bref/extensions/terrarium.so` and the ini file. Publish it with the AWS CLI:
+
+    ```sh
+    aws lambda publish-layer-version \
+      --layer-name terrarium-php84-arm64 \
+      --compatible-architectures arm64 \
+      --zip-file fileb://terrarium-vX-php8.4-lambda-bref-arm64.zip
+    ```
+
+    Reference the returned ARN alongside your Bref runtime layer in your `serverless.yml` or CDK stack.
+  </Step>
+
+  <Step title="Ship PHP library and guest engine">
+    Ship the PHP library (`vendor/`) alongside your code in `/var/task`. On Lambda the module cache cannot survive a cold start, so do **not** ship the raw `.wasm` guest. Instead, ship a **precompiled artifact** (`.cwasm`) and construct with `precompiled: true`.
+
+    Every Lambda build in a release comes with the TypeScript guest already precompiled for that exact `.so` in `terrarium-vX-phpY-lambda-bref-ARCH-precompiled-guests.zip`. Verify the `SHA256SUMS` file inside the zip, then use it:
+
+    ```php
+    $ts = new Terrarium\Terrarium(
+        __DIR__ . '/typescript_guest.cwasm',
+        precompiled: true
+    );
+    ```
+  </Step>
+</Steps>
+
+## Build from source
+
+A plain `cargo cdylib` — no `phpize` required. You need Rust 1.96+, clang, and PHP 8.4/8.5 dev headers (`php-config`).
+
+```sh
+git clone https://github.com/eddmann/terrarium && cd terrarium
+make release      # -> target/release/libterrarium.so (or .dylib on macOS)
+make test         # optional: Rust unit tests + the PHP suites
+```
+
+The guest `.wasm` fixtures are **committed** at `tests/wasm/*.wasm`, so no WASM toolchain is required just to build and test the extension. You only need to rebuild a guest if you want to change it:
+
+```sh
+# Pure-Rust guests — only needs: rustup target add wasm32-unknown-unknown
+make boa-guest rustpython-guest
+
+# C-based guests — needs a WASI SDK: WASI_SDK=/path/to/wasi-sdk
+make quickjs-guest php-guest typescript-guest
+
+# All five at once
+make guests
+```
+
+See each guest's README under `guests/<name>/README.md` for its specific toolchain and build details.
+
+## Choosing the right binary
+
+- **PHP version** must match exactly. An extension built for PHP 8.4 will not load in PHP 8.5, and vice versa.
+- **Architecture** must match. Download `x86_64` for Intel/AMD hardware and `aarch64`/`arm64` for ARM hardware (including AWS Graviton and Apple Silicon).
+- **glibc**: the Lambda/Bref build (glibc 2.34) is the most portable on Linux. The generic Linux build (glibc 2.35) requires a reasonably recent distribution.
+- All builds are **NTS** (non-thread-safe) — what CLI, FPM, and Bref use.

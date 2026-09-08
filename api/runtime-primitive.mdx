@@ -1,0 +1,169 @@
+---
+title: "Terrarium\\Runtime — The Native Engine Primitive"
+sidebarTitle: "Runtime Primitive"
+description: "Terrarium\\Runtime is the Rust-backed engine primitive. Use it directly when you need byte-level access, setCompileOptions(), setTypes(), or the analyze() method."
+---
+
+`Terrarium\Runtime` is the low-level engine primitive provided by the Rust extension. The `Terrarium\Terrarium` facade wraps it: it reads a file path, infers types from your PHP closures, and calls `setTypes()` after each `register()`. Use `Runtime` directly when you need to work with raw bytes, build a custom wrapper, set compile options manually via `setCompileOptions()`, or manage type declarations yourself with `setTypes()`.
+
+<Tip>
+Most users should use `Terrarium\Terrarium` (the facade) rather than `Runtime` directly. The facade handles file loading, type inference, and declaration pushing for you.
+</Tip>
+
+<Note>
+`Terrarium\Runtime` is implemented in Rust via [ext-php-rs](https://github.com/davidcole1340/ext-php-rs). It is a real PHP class registered by the extension — not a stub, interface, or generated polyfill. `class_exists('Terrarium\\Runtime')` returns `true` only when the extension is loaded.
+</Note>
+
+## When to use Runtime directly
+
+- **Working with bytes, not paths.** The facade calls `file_get_contents()` internally. If your WASM bytes come from a database, an S3 download, or any source that isn't a local file path, `Runtime` lets you pass them directly.
+- **Building a custom wrapper.** If you need to manage multiple guests, multiplex a pool, or add middleware around capability dispatch, `Runtime` is the surface to extend.
+- **Setting compile options manually.** `setCompileOptions()` accepts an open map that the guest reads before accepting a program. The facade translates `syncOnly:` and `typeArgumentSchemas:` into this map; raw callers set it themselves.
+- **Calling `setTypes()` manually.** When managing `.d.ts` declarations without the facade's type-inference pipeline.
+
+## Constructor
+
+The `Runtime` constructor accepts bytes as its first argument — not a file path.
+
+```php
+$bytes = file_get_contents('quickjs_guest.wasm');
+$rt = new Terrarium\Runtime($bytes, memoryLimit: 32 * 1024 * 1024, timeoutMs: 500);
+```
+
+All the same resource-limit options as the facade constructor are available:
+
+<ParamField path="$bytes" type="string" required>
+  Raw WASM bytes (or a precompiled artifact when `precompiled: true`). Pass the
+  result of `file_get_contents()`, a network response body, or any other binary
+  string — not a file path.
+</ParamField>
+
+<ParamField path="memoryLimit" type="int | null">
+  Caps linear-memory growth in bytes. A `memory.grow` past this limit raises
+  `Terrarium\MemoryException`. Defaults to unbounded.
+</ParamField>
+
+<ParamField path="timeoutMs" type="int | null">
+  The default wall-clock budget for each operation (epoch interruption). Omitted
+  or null means unbounded. This is the constructor default; individual calls can
+  override it — see [Per-Call Timeouts](/api/per-call-timeouts).
+</ParamField>
+
+<ParamField path="maxStack" type="int | null">
+  The native call-stack cap in bytes. Defaults to unbounded.
+</ParamField>
+
+<ParamField path="fuel" type="int | null">
+  Deterministic instruction metering — an alternative to `timeoutMs` for
+  reproducible runs. Exhaustion raises `Terrarium\TimeoutException`. Whether fuel
+  metering is **enabled** is compiled into a precompiled artifact; the budget
+  value itself is not.
+</ParamField>
+
+<ParamField path="isolated" type="bool">
+  `true` runs each `eval()` in a fresh WASM instance (hermetic per call). The
+  default reuses one persistent instance (cheaper, and it keeps engine-internal
+  state such as the TypeScript compiler warm).
+</ParamField>
+
+<ParamField path="precompiled" type="bool">
+  `true` tells the engine that `$bytes` is an ahead-of-time artifact from
+  `Terrarium\Runtime::precompile()`, not raw WASM. The artifact is loaded without
+  compiling, eliminating Cranelift cold-start cost. See
+  [precompile()](/api/precompile) for the full trust and compatibility model.
+</ParamField>
+
+## setCompileOptions(array $options): void
+
+Pushes an open options map to the guest. The guest reads this map before accepting
+a program, and ignores keys it does not recognise — new options can be added
+without breaking older guests.
+
+Known keys:
+
+| Key | Type | Effect |
+|---|---|---|
+| `sync_only` | `bool` | TypeScript guest rejects `async`/`await`/`for await`/`function*`/`yield` and every promise use at compile time. Other guests accept the key and ignore it. |
+| `type_argument_schemas` | `string[]` | List of callee names whose single type argument the TypeScript guest should derive a JSON Schema from. Returned by `analyze()`. |
+
+```php
+$rt = new Terrarium\Runtime($wasmBytes);
+
+// Reject async and generator syntax at compile time:
+$rt->setCompileOptions(['sync_only' => true]);
+
+// Extract JSON Schemas from type arguments at named call sites:
+$rt->setCompileOptions(['type_argument_schemas' => ['ctx.model', 'ctx.agent']]);
+```
+
+Multiple calls to `setCompileOptions()` replace the previous options map — they do
+not merge. Pass all options you need in a single call, or merge the arrays yourself
+before calling.
+
+## setTypes(string $dts): void
+
+Pushes a TypeScript `.d.ts` declaration string to the guest. The TypeScript guest
+type-checks every submitted program against these declarations, so this is what
+gives the guest knowledge of your registered SDK.
+
+When using the `Terrarium\Terrarium` facade, `register()` calls `setTypes()`
+automatically after inferring the `.d.ts` from your PHP signatures and PHPDoc.
+Call `setTypes()` directly when you are managing declarations by hand — for
+example, when loading a hand-authored declaration file, or building a wrapper that
+generates its own declarations.
+
+```php
+$rt = new Terrarium\Runtime($wasmBytes);
+$rt->register('user.fetch', fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin']]);
+
+// Push a hand-authored declaration:
+$dts = file_get_contents('my-sdk.d.ts');
+$rt->setTypes($dts);
+```
+
+## precompile() on Runtime
+
+The static `Terrarium\Runtime::precompile()` method takes raw bytes rather than a
+file path — the byte-level counterpart of `Terrarium\Terrarium::precompile()`:
+
+```php
+$artifact = Terrarium\Runtime::precompile($wasmBytes, fuel: 1);
+$rt       = new Terrarium\Runtime($artifact, precompiled: true, fuel: 5_000_000);
+```
+
+Pass the same `fuel` setting you will construct with — fuel metering is compiled
+into the artifact and must match on both ends. See [precompile()](/api/precompile)
+for the full parameter reference, compatibility matrix, and trust model.
+
+## analyze() on Runtime
+
+`analyze()` runs the same static pass as `check()`, plus anything the guest was
+additionally asked to extract. It returns a map with two keys:
+
+```php
+['diagnostics' => [...], 'schemas' => [...]]
+```
+
+`diagnostics` is exactly what `check()` returns. `schemas` is populated when
+`type_argument_schemas` has been set via `setCompileOptions()`:
+
+```php
+$rt = new Terrarium\Runtime($wasmBytes);
+$rt->setCompileOptions(['type_argument_schemas' => ['ctx.model', 'ctx.agent']]);
+
+$result = $rt->analyze($source);
+// [
+//   'diagnostics' => [...],
+//   'schemas'     => [
+//     ['ordinal' => 0, 'callee' => 'ctx.agent', 'line' => 1, 'schema' => '{"type":"object",…}'],
+//   ]
+// ]
+```
+
+Nothing executes during `analyze()`, exactly as with `check()`. A guest without
+the optional `analyze` export raises `Terrarium\Exception`; of the bundled guests
+only the **TypeScript** guest implements it.
+
+`analyze()` also accepts an optional per-call `?int $timeoutMs = null` argument
+with the same semantics as `eval()` and `check()` — see
+[Per-Call Timeouts](/api/per-call-timeouts).

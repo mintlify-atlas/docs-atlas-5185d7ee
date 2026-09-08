@@ -1,0 +1,91 @@
+---
+title: "register() — Expose PHP Functions as Guest Capabilities"
+sidebarTitle: "register()"
+description: "register() adds a PHP callable to the capability allowlist under a dotted name. It is the entire trust boundary: the guest can reach nothing you did not register."
+---
+
+```php
+register(string $name, callable $fn): void
+```
+
+`register()` exposes a PHP callable to the guest under a flat, dotted name. The registered allowlist is the **entire trust boundary** — the guest can reach nothing you have not explicitly registered. There is no synthetic root: a capability named `user.fetch` is called as `user.fetch(...)` in the guest, not as `sdk.user.fetch(...)`.
+
+After each `register()` call, the TypeScript guest's type declaration (`.d.ts`) is regenerated from all registered closures and pushed to the guest. This means the TypeScript compiler inside the guest always type-checks against an up-to-date SDK as capabilities are added.
+
+## Name rules
+
+Every dotted segment of the capability name must be a valid identifier matching `[A-Za-z_][A-Za-z0-9_]*`. Names that fail this check throw `\InvalidArgumentException`. This also rejects `$`-prefixed names that are reserved by the guest bridge (`$out`, `$names`, `$error`).
+
+**Reserved top-level names** — registering these throws `\InvalidArgumentException`:
+
+| Name | Reason |
+|---|---|
+| `__host` | Guest bridge dispatch table root |
+| `_hostcall` | Internal host-call mechanism |
+| `__ns` | Bridge namespace object |
+| `_NS` | Bridge namespace object |
+| `__TerrariumNs` | Terrarium internal namespace |
+
+**Shadow-prone top-level names** — registering these works, but triggers `E_USER_WARNING`:
+
+`console`, `print`, `Math`, `JSON`, `globalThis`
+
+<Warning>
+  Because there is no synthetic root, a top-level name like `console` becomes a guest global and replaces the built-in. This can break expected guest behaviour (e.g. `console.log` for output capture). Use a distinct namespace prefix such as `host.console` to avoid shadowing.
+</Warning>
+
+## Type inference
+
+Types are inferred automatically from the closure's PHP signature and PHPDoc — there is no separate schema to write. The inferred types are used to generate `.d.ts`, `.pyi`, and PHP stub output via `types()`, and the TypeScript guest type-checks every `eval()` against that declaration.
+
+PHPDoc shapes such as `@return array{name: string, roles: string[]}` are parsed and translated to TypeScript object types and TypedDicts. See [type inference](/concepts/type-inference) for the full mapping.
+
+## Registering an existing name
+
+Calling `register()` with a name that was already registered replaces its callable. The type declaration is updated accordingly.
+
+## Examples
+
+### Simple typed capability
+
+```php
+$t->register('math.add', fn (int $a, int $b): int => $a + $b);
+```
+
+### Capability returning a structured object (PHPDoc shape)
+
+```php
+$t->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+```
+
+The TypeScript guest infers the return type as `{ name: string; roles: string[] }` and type-checks calls accordingly.
+
+### Capability capturing host context
+
+```php
+$log = [];
+$t->register('log.info', function (string $message) use (&$log): void {
+    $log[] = $message;
+});
+```
+
+### Full SDK registration example
+
+```php
+$t->register('math.add',   fn (int $a, int $b): int => $a + $b);
+$t->register('math.sqrt',  fn (float $n): float => sqrt($n));
+
+$t->register('user.fetch',
+    /** @return array{name: string, roles: string[]} */
+    fn (int $id): array => ['name' => 'Ada', 'roles' => ['admin', 'dev']]);
+
+$t->register('user.list',
+    /** @return array<array{id: int, name: string}> */
+    fn (): array => [['id' => 1, 'name' => 'Ada'], ['id' => 2, 'name' => 'Bob']]);
+```
+
+<Note>
+  Capabilities exchange data as scalars, arrays, and opaque handles — PHP functions and closures cannot cross the Wasm boundary. If you need to pass a stateful object (a database connection, a file handle) to the guest, use [`grant()`](/api/handles) to obtain an opaque integer handle that the guest can pass back to a capability callback.
+</Note>
